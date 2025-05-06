@@ -43,6 +43,16 @@ _ALL_RECIPES = [
         supports_distributed=False,
     ),
     Recipe(
+        name="dev/async_grpo_monarch",
+        file_path="dev/async_grpo_monarch.py",
+        configs=[
+            Config(
+                name="dev/qwen3B_async_grpo", file_path="dev/qwen3B_async_grpo.yaml"
+            ),
+        ],
+        supports_distributed=False,
+    ),
+    Recipe(
         name="full_finetune_single_device",
         file_path="full_finetune_single_device.py",
         configs=[
