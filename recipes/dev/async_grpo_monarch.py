@@ -5,7 +5,7 @@ import logging
 import os
 import time
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Generic, List, Optional, TypeVar
 
 import torch
 import torch.distributed
@@ -27,10 +27,13 @@ from torchtune.dev.rl.datatypes import RequestOutput, Trajectory
 from torchtune.dev.rl.utils import stateless_init_process_group
 from torchtune.recipe_interfaces import OrchestrationRecipeInterface
 from vllm import LLM, SamplingParams
+from vllm.config import DeviceConfig
 from vllm.outputs import RequestOutput as vllmRequestOutput
 
 from vllm.utils import get_ip, get_open_port
 from vllm.worker.worker import Worker
+
+T = TypeVar("T")
 
 
 # ========= Constants =========
@@ -40,6 +43,26 @@ _LOG_PROBS_KEY = "log_probs"
 
 
 # ========= Logging related components =========
+class DisabledMetricsLoggerActor(Actor):
+    """For developing quickly (skip the wandb init overhead)"""
+
+    def __init__(self, cfg):
+        pass
+
+    @endpoint
+    async def log_dict(self, log_dict, step=None):
+        logger = get_logger()
+        logger.info("logging %s at step %s", log_dict, step)
+
+    @endpoint
+    async def log_table(self, table_data, columns, table_name, step=None):
+        pass
+
+    @endpoint
+    async def close(self):
+        pass
+
+
 class MetricLoggerActor(Actor):
     """Metric logger for all actors."""
 
@@ -96,16 +119,21 @@ class MonarchLogger(logging.Logger):
         caller_self = caller_frame.frame.f_locals.get("self")
         caller_function = caller_frame.function
 
-        if caller_self:
-            if caller_self.__class__.__repr__ is object.__repr__:
-                class_name = caller_self.__class__.__name__
-                try:
-                    caller_repr = f"{class_name}-({current_rank()}/{current_size()})"
-                except Exception as e:
-                    caller_repr = class_name
-            else:
-                caller_repr = str(caller_self)
-            msg = f"{self.BLUE}[Monarch::{caller_repr}::{caller_function}]{self.RESET} {msg}"
+        try:
+            if caller_self:
+                if caller_self.__class__.__repr__ is object.__repr__:
+                    class_name = caller_self.__class__.__name__
+                    try:
+                        caller_repr = (
+                            f"{class_name}-({current_rank()}/{current_size()})"
+                        )
+                    except Exception as e:
+                        caller_repr = class_name
+                else:
+                    caller_repr = str(caller_self)
+                msg = f"{self.BLUE}[Monarch::{caller_repr}::{caller_function}]{self.RESET} {msg}"
+        except Exception:
+            msg = f"{self.BLUE}[Monarch::{caller_function}]{self.RESET} {msg}"
 
         super()._log(level, msg, args, exc_info, extra, stack_info, stacklevel)
 
@@ -121,6 +149,27 @@ def get_logger() -> logging.Logger:
 
 
 # ========= Generic data structures =========
+class QueueActor(Actor, Generic[T]):
+    def __init__(self):
+        self.logger = get_logger()
+        self._q: asyncio.Queue[T] = asyncio.Queue()
+
+    @endpoint
+    async def put(self, item: T) -> None:
+        self.logger.info("putting %s", item)
+        await self._q.put(item)
+
+    @endpoint
+    async def get(self) -> T:
+        return await self._q.get()
+
+    @endpoint
+    async def qsize(self) -> int:
+        return self._q.qsize()
+
+    @endpoint
+    async def is_empty(self) -> bool:
+        return self._q.empty()
 
 
 # ========= Cabernet actors =========
@@ -156,6 +205,10 @@ class SyncLLMCollector(SyncDataCollector):
         # Create data loader
         from torchtune import config
 
+        device_idx = (
+            self.global_rank * self.cfg.inference.tensor_parallel_dim + self.local_rank
+        )
+        device = torch.device(f"cuda:{device_idx}")
         self._tokenizer = config.instantiate(self.cfg.tokenizer)
         dataloader = self._setup_data(
             self.cfg.dataset,
@@ -183,6 +236,7 @@ class SyncLLMCollector(SyncDataCollector):
             dtype="bfloat16",
             # worker_cls=VLLMWorkerWrapper,
             tensor_parallel_size=self.cfg.inference.tensor_parallel_dim,
+            device=device,
             **self.cfg.inference.get("engine_args", {}),
         )
         self.generation_time = 0
@@ -195,6 +249,7 @@ class SyncLLMCollector(SyncDataCollector):
             weight_update_sender=None,
             reset_at_each_iter=self.reset_at_each_iter,
             use_buffers=False,
+            device=device,
             # This argument allows a non-TensorDictModule policy to be assumed
             # to be compatible with the collector
             trust_policy=True,
@@ -218,52 +273,53 @@ class SyncLLMCollector(SyncDataCollector):
                 - text_response: generated text strings
                 - log_probs: log probabilities of generated tokens
         """
-        start = time.perf_counter()
-        text_input = data.get("text")
-        if not isinstance(text_input, (list, str)):
-            text_input = text_input.tolist()
-        token_outputs: List[vllmRequestOutput] = self.inference_server.generate(
-            text_input,
-            sampling_params=SamplingParams(
-                n=1,
-                max_tokens=self.cfg.inference.max_generated_tokens,
-                temperature=self.cfg.inference.temperature,
-                detokenize=True,
-                prompt_logprobs=False,
-                logprobs=True,
-            ),
-            use_tqdm=False,
-        )
-        # convert the vllmRequestOutput to a TensorDict
-        outputs: RequestOutput = RequestOutput.from_request_output(token_outputs)
-        response = outputs.outputs._tensordict.select(
-            "text", "token_ids", "logprobs", strict=False
-        )
-        # replace with correct keys
-        response.rename_key_("token_ids", _TOK_RESPONSE_KEY)
-        response.rename_key_("text", _TEXT_RESPONSE_KEY)
-        response.rename_key_("logprobs", _LOG_PROBS_KEY)
-
-        if pad_outputs:
-            padding = self._tokenizer.pad_id
-            response = response.densify(layout=torch.strided).to_padded_tensor(
-                padding=padding,
+        with self.device:
+            start = time.perf_counter()
+            text_input = data.get("text")
+            if not isinstance(text_input, (list, str)):
+                text_input = text_input.tolist()
+            token_outputs: List[vllmRequestOutput] = self.inference_server.generate(
+                text_input,
+                sampling_params=SamplingParams(
+                    n=1,
+                    max_tokens=self.cfg.inference.max_generated_tokens,
+                    temperature=self.cfg.inference.temperature,
+                    detokenize=True,
+                    prompt_logprobs=False,
+                    logprobs=True,
+                ),
+                use_tqdm=False,
             )
-            padded_values = response[_TOK_RESPONSE_KEY] == padding
-            if padded_values.any():
-                lps = response[_LOG_PROBS_KEY]
-                lps = torch.where(expand_as_right(~padded_values, lps), lps, 1.0)
-                response[_LOG_PROBS_KEY] = lps
+            # convert the vllmRequestOutput to a TensorDict
+            outputs: RequestOutput = RequestOutput.from_request_output(token_outputs)
+            response = outputs.outputs._tensordict.select(
+                "text", "token_ids", "logprobs", strict=False
+            )
+            # replace with correct keys
+            response.rename_key_("token_ids", _TOK_RESPONSE_KEY)
+            response.rename_key_("text", _TEXT_RESPONSE_KEY)
+            response.rename_key_("logprobs", _LOG_PROBS_KEY)
 
-        assert set(response.keys()) == set(
-            [_TOK_RESPONSE_KEY, _TEXT_RESPONSE_KEY, _LOG_PROBS_KEY],
-        ), "got keys {}".format(response.keys())
+            if pad_outputs:
+                padding = self._tokenizer.pad_id
+                response = response.densify(layout=torch.strided).to_padded_tensor(
+                    padding=padding,
+                )
+                padded_values = response[_TOK_RESPONSE_KEY] == padding
+                if padded_values.any():
+                    lps = response[_LOG_PROBS_KEY]
+                    lps = torch.where(expand_as_right(~padded_values, lps), lps, 1.0)
+                    response[_LOG_PROBS_KEY] = lps
 
-        # clone the input tensordict to preserve stateless transforms from breaking
-        action = data.clone()
-        action.update(response, keys_to_update=list(response.keys()))
-        self.generation_time += time.perf_counter() - start
-        return action
+            assert set(response.keys()) == set(
+                [_TOK_RESPONSE_KEY, _TEXT_RESPONSE_KEY, _LOG_PROBS_KEY],
+            ), "got keys {}".format(response.keys())
+
+            # clone the input tensordict to preserve stateless transforms from breaking
+            action = data.clone()
+            action.update(response, keys_to_update=list(response.keys()))
+            self.generation_time += time.perf_counter() - start
+            return action
 
     def _setup_data(
         self,
@@ -477,6 +533,8 @@ class RolloutActor(Actor):
         self,
         global_rank: int,
         cfg: DictConfig,
+        metric_actor: MetricLoggerActor,
+        rollout_queue_actor: QueueActor,
         reset_at_each_iter: bool = False,
         dialog_turns_per_batch: int = 1,
     ):
@@ -485,9 +543,11 @@ class RolloutActor(Actor):
         self.reset_at_each_iter = reset_at_each_iter
         self._shuttle = None
         self.dialog_turns_per_batch = dialog_turns_per_batch
+        self._metric_actor = metric_actor
+        self._rollout_queue_actor = rollout_queue_actor
 
         # local_rank = parallelism rank within a distributed group
-        self.local_rank = current_rank()
+        self.local_rank = current_rank()["gpus"]
         # global_rank = index of this rollout actor out of all rollout actors
         self.global_rank = global_rank
 
@@ -502,7 +562,21 @@ class RolloutActor(Actor):
           and errors can be propagated.
 
         """
-        self.logger.info("Initializing rollout actor...")
+        # Set CUDA visible devices
+        # TODO - some checking here?
+        vllm_world_size = self.cfg.inference.tensor_parallel_dim
+        gpu_indices = list(
+            range(
+                self.global_rank * vllm_world_size,
+                (self.global_rank + 1) * vllm_world_size,
+            )
+        )
+        # The following env variables help guarantee GPU isolation
+        gpu_indices = ",".join(str(idx) for idx in gpu_indices)
+        os.environ["LOCAL_RANK"] = str(self.local_rank)
+        os.environ["CUDA_VISIBLE_DEVICES"] = gpu_indices
+        os.environ["NCCL_P2P_DISABLE"] = "1"
+        # os.environ["VLLM_USE_V1"] = "1"
         self.collector = SyncLLMCollector(
             cfg=self.cfg,
             local_rank=self.local_rank,
@@ -522,12 +596,34 @@ class RolloutActor(Actor):
             trajectories, runtime_metrics = self.collector.rollout_step(
                 policy_version=0
             )
-            self.logger.info("trajectories: %s", trajectories)
-            self.logger.info("metrics: %s", runtime_metrics)
-            # self.metric_logger.
+            # push to metrics logger
+            await self._metric_actor.log_dict(runtime_metrics).call()
+            # push to queue
+            await self._rollout_queue_actor.put(trajectories).call()
 
     def __repr__(self) -> str:
-        return f"RolloutActor[local_rank=({current_rank()},{current_size()}),global_rank={self.global_rank}]"
+        return f"RolloutActor(g{self.global_rank}/{self.cfg.orchestration.num_inference_workers})[l{self.local_rank}/{self.cfg.inference.tensor_parallel_dim})]"
+
+
+class RewardActor(Actor):
+    def __init__(
+        self,
+        global_rank: int,
+        cfg: DictConfig,
+        rollout_queue_actor: QueueActor,
+        replay_buffer=None,
+    ):
+        self.cfg = cfg
+        self._rollout_queue_actor = rollout_queue_actor
+        self._replay_buffer = replay_buffer
+        self.global_rank = global_rank
+        self.local_rank = current_rank()
+
+    def initialize(self):
+        pass
+
+    def __repr__(self) -> str:
+        return f"RewardActor[local_rank=({current_rank()},{current_size()}),global_rank={self.global_rank}]"
 
 
 # ========= Recipe =========
@@ -537,23 +633,33 @@ class MonarchGRPORecipe(OrchestrationRecipeInterface):
         self.logger.info("initializing w/ config: ", cfg)
         self.cfg = cfg
 
-        self.num_shards_per_inference_worker = (
-            cfg.orchestration.num_shards_per_inference_worker
-        )
+        self.tensor_parallel_dim = cfg.inference.tensor_parallel_dim
         self.num_inference_workers = cfg.orchestration.num_inference_workers
         self.num_postprocessing_workers = cfg.orchestration.num_postprocessing_workers
         self.num_training_workers = cfg.orchestration.num_training_workers
 
-        # Create Proc meshes
+        # singleton_proc_mesh is the designated proc where
+        # global entities (metric logger, queue) are spawned.
+        self.singleton_proc_mesh = await proc_mesh(gpus=1, env={})
+        self.metric_actor = await self.singleton_proc_mesh.spawn(
+            "metrics", DisabledMetricsLoggerActor, cfg=cfg
+        )
+        self.rollout_queue_actor = await self.singleton_proc_mesh.spawn(
+            "queue", QueueActor
+        )
+
+        # Create rollout actors and meshes
+        # TODO - might be better to create a big proc mesh and split?
         self.rollout_proc_meshes = []
         self.rollout_actor_meshes = []
-        print(
-            f"Creating {self.num_inference_workers} meshes of size {self.num_shards_per_inference_worker}..."
+
+        self.logger.info(
+            f"Creating {self.num_inference_workers} meshes of size {self.tensor_parallel_dim}..."
         )
         for i in range(self.num_inference_workers):
             self.rollout_proc_meshes.append(
                 await proc_mesh(
-                    gpus=self.num_shards_per_inference_worker,
+                    gpus=self.tensor_parallel_dim,
                     env={},
                 )
             )
@@ -563,14 +669,24 @@ class MonarchGRPORecipe(OrchestrationRecipeInterface):
                     RolloutActor,
                     global_rank=i,
                     cfg=cfg,
+                    metric_actor=self.metric_actor,
+                    rollout_queue_actor=self.rollout_queue_actor,
                 )
             )
 
+        # Create reward actors and meshes
+        self.reward_proc_meshes = []
+        self.reward_actor_meshes = []
+
     async def run(self):
         self.logger.info("initializing actors")
-        [await a.initialize().broadcast_and_wait() for a in self.rollout_actor_meshes]
+        await asyncio.gather(
+            *[a.initialize().broadcast_and_wait() for a in self.rollout_actor_meshes]
+        )
         self.logger.info("running rollout actors")
-        [await a.run().broadcast_and_wait() for a in self.rollout_actor_meshes]
+        await asyncio.gather(
+            *[a.run().broadcast_and_wait() for a in self.rollout_actor_meshes]
+        )
 
     async def cleanup(self):
         self.logger.info("cleaning up")
