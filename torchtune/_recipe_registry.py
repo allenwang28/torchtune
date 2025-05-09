@@ -47,7 +47,8 @@ _ALL_RECIPES = [
         file_path="dev/async_grpo_monarch.py",
         configs=[
             Config(
-                name="dev/qwen3B_async_grpo", file_path="dev/qwen3B_async_grpo.yaml"
+                name="dev/monarch_qwen3B_async_grpo",
+                file_path="dev/monarch_qwen3B_async_grpo.yaml",
             ),
         ],
         supports_distributed=False,

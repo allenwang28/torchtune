@@ -11,6 +11,9 @@ from typing import Any, Callable, Dict, Optional
 import ray
 import torch
 
+from monarch.proc_mesh import proc_mesh
+from monarch.service import Actor, endpoint
+
 from omegaconf import DictConfig, ListConfig
 
 from ray.util.queue import Full as QueueFull
@@ -32,7 +35,7 @@ from vllm.worker.worker import Worker
 log = utils.get_logger()
 
 
-class SyncLLMCollector(SyncDataCollector):
+class SyncLLMCollector(Actor, SyncDataCollector):
     """A simplified version of SyncDataCollector for LLM inference."""
 
     def __init__(
