@@ -1,10 +1,9 @@
 import asyncio
-import functools
 import inspect
-import itertools
 import logging
 import os
 import time
+from functools import partial
 
 from typing import Any, Dict, Generic, List, Optional, TypeVar
 
@@ -22,14 +21,17 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from torchrl.collectors import SyncDataCollector
 
-from torchrl.data import LazyStackStorage, RayReplayBuffer
+from torchrl.data import LazyStackStorage, ReplayBuffer
 from torchtune import config, generation, rlhf, utils
 from torchtune.dev.rl.datatypes import RequestOutput, Trajectory
 from torchtune.dev.rl.rewards import batched_rewards
+from torchtune.dev.rl.types import GRPOStats, GRPOTrajectory
 
 from torchtune.dev.rl.utils import stateless_init_process_group
+from torchtune.modules.transformer import TransformerSelfAttentionLayer
 from torchtune.recipe_interfaces import OrchestrationRecipeInterface
-from torchtune.training import disable_dropout
+
+from torchtune.training import disable_dropout, DummyProfiler, PROFILER_KEY
 from vllm import LLM, SamplingParams
 from vllm.outputs import RequestOutput as vllmRequestOutput
 
@@ -178,6 +180,31 @@ class QueueActor(Actor, Generic[T]):
         return self._q.empty()
 
 
+class ReplayBufferActor(Actor):
+    def __init__(
+        self, cfg: DictConfig):
+        self.rb = ReplayBuffer(
+            storage=partial(LazyStackStorage, max_size=cfg.orchestration.replay_buffer_size),
+            batch_size=cfg.training.batch_size)
+        self.logger = get_logger()
+
+    @endpoint
+    async def extend(self, sample: Trajectory):
+        self.rb.extend(sample)
+
+    @endpoint
+    async def sample(self) -> torch.Tensor:
+        return self.rb.sample()
+
+    @endpoint
+    async def len(self) -> int:
+        return len(self.rb)
+
+    @endpoint
+    async def is_empty(self) -> bool:
+        return len(self.rb) == 0
+
+
 def get_device(
     entity: str, local_rank: int, global_rank: int, cfg: DictConfig
 ) -> torch.device:
@@ -190,14 +217,24 @@ def get_device(
     This is a placeholder implementation for now, and would need to change in a multi-host setting.
     """
     entity_world_size = -1
-    if entity == "rollout":
-        entity_world_size = cfg.inference.tensor_parallel_dim
+    trainer_world_size = cfg.orchestration.num_training_workers
+    rollout_world_size = (
+        cfg.inference.tensor_parallel_dim * cfg.orchestration.num_inference_workers
+    )
+    postprocessing_world_size = (
+        cfg.postprocessing.tensor_parallel_dim
+        * cfg.orchestration.num_postprocessing_workers
+    )
+
+    if entity == "training":
+        entity_world_size = trainer_world_size
         offset = 0
+    elif entity == "rollout":
+        entity_world_size = rollout_world_size
+        offset = trainer_world_size
     elif entity == "postprocessing":
-        entity_world_size = cfg.postprocessing.tensor_parallel_dim
-        offset = (
-            cfg.inference.tensor_parallel_dim * cfg.orchestration.num_inference_workers
-        )
+        entity_world_size = postprocessing_world_size
+        offset = trainer_world_size + rollout_world_size
     else:
         raise KeyError(f"Unknown entity: {entity}")
 
@@ -405,7 +442,7 @@ class SyncLLMCollector(SyncDataCollector):
             batch_size=batch_size,
             sampler=sampler,
             collate_fn=(
-                functools.partial(
+                partial(
                     _get_component_from_path(collate_str),
                     padding_idx=self._tokenizer.pad_id,
                 )
@@ -513,7 +550,7 @@ class SyncLLMCollector(SyncDataCollector):
             logprobs=logprobs.to("cpu"),
             ref_logprobs=None,
             query_response_padding_masks=query_response_padding_masks.to("cpu"),
-            seq_lens=seq_lens,
+            seq_lens=seq_lens.to("cpu"),
             answers=answers,
             policy_version=policy_version,
             rewards=None,
@@ -614,20 +651,24 @@ class RolloutActor(Actor):
 
     @endpoint
     async def run(self):
+        # hack to reset stream logs (vLLM hijacks it at some point)
+        self.logger = get_logger()
         self.logger.info("Running rollout actor...")
 
         num_steps = 10
         for i in range(num_steps):
+            # TODO - check for update
             self.logger.info(f"starting rollout for step {i}")
             trajectories, runtime_metrics = self.collector.rollout_step(
                 policy_version=0
             )
-            # push to metrics logger
             await self._metric_actor.log_dict(runtime_metrics).call()
-            # push to queue
-            self.logger.info("pushing to queue.")
+            # TODO - the first rollout step triggers vLLM initialization which should not be necessary.
+            # We should be able to avoid this, but needs further investigation.
+            # TODO - time the push to queue time?
+            self.logger.info("pushing to queue")
             await self._rollout_queue_actor.put(trajectories).call()
-            self.logger.info("done pushing to queue.")
+            self.logger.info("done pushing to queue")
 
     def __repr__(self) -> str:
         return f"RolloutActor(global={self.global_rank}/{self.cfg.orchestration.num_inference_workers})[local={self.local_rank}/{self.cfg.inference.tensor_parallel_dim})]"
@@ -641,7 +682,7 @@ class PostProcessingActor(Actor):
         cfg: DictConfig,
         metric_actor: MetricLoggerActor,
         rollout_queue_actor: QueueActor,
-        replay_buffer=None,
+        replay_buffer: ReplayBufferActor,
     ):
         self.cfg = cfg
         self.rollout_queue_actor = rollout_queue_actor
@@ -784,6 +825,8 @@ class PostProcessingActor(Actor):
 
     @endpoint
     async def run(self):
+        # hack to reset stream logs (vLLM hijacks it at some point)
+        self.logger = get_logger()
         self.logger.info("running postprocessor")
 
         idx = 0
@@ -872,9 +915,7 @@ class PostProcessingActor(Actor):
                 )  # These are (B, G, num_funcs)
 
                 # Compute advantages: B, G, num_funcs -> B, G
-                self.logger.info("computing batched rewards")
                 group_rewards = rewards_by_fn.sum(-1)
-                self.logger.info("computed batched rewards: {}".format(group_rewards))
 
                 # To compute advantage, subtract the mean of the group rewards from each group reward
                 group_advantages = (
@@ -913,7 +954,7 @@ class PostProcessingActor(Actor):
                 trajectory = trajectory.cpu()
 
                 # Update circular queue
-                # self.replay_buffer.extend(trajectory)
+                await self.replay_buffer.extend(trajectory).call()
 
                 # End of step timing
                 time_total_ref_step = time.perf_counter() - time_step_start
@@ -948,6 +989,890 @@ class PostProcessingActor(Actor):
         return f"PostProcessingActor(global={self.global_rank}/{self.cfg.orchestration.num_postprocessing_workers})[local={self.local_rank}/{self.cfg.postprocessing.tensor_parallel_dim})]"
 
 
+class TrainingActor(Actor):
+    def __init__(
+        self,
+        cfg: DictConfig,
+        metric_actor: MetricLoggerActor,
+        replay_buffer: ReplayBufferActor,
+        address: str,
+        port: str,
+    ):
+        self.cfg = cfg
+        self.local_rank = current_rank()["gpus"]
+        self.metric_actor = metric_actor
+        self.replay_buffer = replay_buffer
+        self.logger = get_logger()
+        self._address = address
+        self._port = port
+
+    @endpoint
+    async def initialize(self):
+        self.logger.info("initializing trainer...")
+
+        # Distributed training setup: Simulate torchrun environment
+        os.environ["RANK"] = str(self.local_rank)
+        os.environ["WORLD_SIZE"] = str(self.cfg.orchestration.num_training_workers)
+        os.environ["MASTER_ADDR"] = str(self._address)
+        os.environ["MASTER_PORT"] = str(self._port)
+        self._device = get_device(
+            entity="training", local_rank=self.local_rank, global_rank=0, cfg=self.cfg
+        )
+        self._dtype = training.get_dtype("bf16", device=self._device)
+        self._output_dir = self.cfg.output_dir
+        self._log_every_n_steps = self.cfg.get("log_every_n_steps", 1)
+        self._log_peak_memory_stats = self.cfg.get("log_peak_memory_stats", True)
+
+        self.fsdp_cpu_offload = self.cfg.training.get("fsdp_cpu_offload", False)
+        self.distributed_backend = training.get_distributed_backend(
+            "cuda", offload_ops_to_cpu=self.fsdp_cpu_offload
+        )
+
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend=self.distributed_backend)
+
+        self.world_size = int(os.environ["WORLD_SIZE"])
+        self.fsdp_group = torch.distributed.new_group(
+            ranks=list(range(self.world_size)), use_local_synchronization=True
+        )
+        self.device_mesh = torch.distributed.device_mesh.DeviceMesh.from_group(
+            self.fsdp_group, device_type="cuda"
+        )
+
+        self._is_rank_zero = self.local_rank == 0
+
+        # Training configuration
+        self._clip_grad_norm = self.cfg.training.get("clip_grad_norm", None)
+
+        # Activation checkpointing and offloading
+        self._enable_activation_checkpointing = self.cfg.training.get(
+            "enable_activation_checkpointing", False
+        )
+        self._enable_activation_offloading = self.cfg.training.get(
+            "enable_activation_offloading", False
+        )
+        if (
+            self._enable_activation_offloading
+            and not self._enable_activation_checkpointing
+        ):
+            raise RuntimeError(
+                "enable_activation_offloading should only be True when enable_activation_checkpointing is True"
+            )
+
+        # Recipe state
+        # torch.cuda.set_device(self._device)
+        # self.seed = training.set_seed(seed=self.cfg.training.seed)
+        self.global_step = 0
+        self._steps_run = 0
+        self._total_dialog_turns = self.cfg.orchestration.num_steps
+
+        # RL parameters
+        self.save_every_n_steps = self.cfg.training.save_every_n_steps
+        self._ppo_epochs = self.cfg.training.ppo_epochs
+
+        # Model and optimizer setup
+        self._checkpointer = config.instantiate(
+            self.cfg.training.checkpointer, resume_from_checkpoint=False
+        )
+        checkpoint_dict = self._checkpointer.load_checkpoint()
+        self._compile = self.cfg.training.get("compile", False)
+        self._model = self._setup_model(
+            cfg_model=self.cfg.model,
+            enable_activation_checkpointing=self._enable_activation_checkpointing,
+            enable_activation_offloading=self._enable_activation_offloading,
+            custom_sharded_layers=self.cfg.training.get(
+                "custom_sharded_layers", None
+            ),
+            fsdp_cpu_offload=self.fsdp_cpu_offload,
+            model_state_dict=checkpoint_dict[training.MODEL_KEY],
+        )
+        self._optimizer = self._setup_optimizer(
+            cfg_optimizer=self.cfg.training.optimizer
+        )
+        self._loss_fn = config.instantiate(self.cfg.training.loss)
+
+        if self._compile:
+            training.compile_loss(self._loss_fn, verbose=self._is_rank_zero)
+
+        # The loss may handle the output projection. If true, the model should skip it.
+        self.linear_loss = getattr(self._loss_fn, "linear_loss", False)
+        self._model.skip_linear_projection = self.linear_loss
+
+        self._tokenizer = config.instantiate(self.cfg.tokenizer)
+
+        # FIXME: need to get _steps_per_epoch when dataloader is no longer per fsdp worker but instead wrapped in vLLM
+        self._lr_scheduler = None
+
+        # Set up profiler, returns DummyProfiler (nullcontext object with no-op `step` method)
+        # if self.cfg is missing profiler key or if `self.cfg.profiler.enabled = False`
+        self._profiler = self._setup_profiler(self.cfg.get(PROFILER_KEY, None))
+        self._steps_before_sync = self.cfg.training.steps_before_weight_sync
+
+        # Initialize policy version for tracking age of trajectories
+        self.policy_version = 0
+        self.metric_logger = None  # Placeholder for the logger
+
+        # Debugging configuration
+        self.debug_logging_enabled = self.cfg.get("debug_logging_enabled", True)
+        self.debug_num_samples_per_step = self.cfg.get(
+            "debug_num_samples_per_step", 2
+        )
+        self.logger.info("done with init")
+
+    def _setup_profiler(
+        self, cfg_profiler: Optional[DictConfig] = None
+    ) -> torch.profiler.profile | DummyProfiler:
+        """Set up the profiler based on the configuration. Returns DummyProfiler if not enabled."""
+        if cfg_profiler is None:
+            cfg_profiler = DictConfig({"enabled": False})
+
+        if cfg_profiler.get("_component_", None) is None:
+            cfg_profiler["_component_"] = "torchtune.training.setup_torch_profiler"
+        else:
+            assert (
+                cfg_profiler.get("_component_")
+                == "torchtune.training.setup_torch_profiler"
+            ), "Only torch profiler supported currently: component must be `torchtune.training.setup_torch_profiler`"
+
+        profiler, profiler_cfg = config.instantiate(cfg_profiler)
+        if self._is_rank_zero:
+            self.logger.info(f"Profiler config after instantiation: {profiler_cfg}")
+            self.profiler_profile_memory = profiler_cfg.get("profile_memory", False)
+            if profiler_cfg["enabled"]:
+                self.profiler_wait_steps = profiler_cfg["wait_steps"]
+                self.profiler_warmup_steps = profiler_cfg["warmup_steps"]
+                self.profiler_active_steps = profiler_cfg["active_steps"]
+        return profiler
+
+    # FIXME: do we need this?
+    def forward(self, *args, **kwargs):
+        """Forward pass through the model."""
+        return self._model(*args, **kwargs)
+
+    def _setup_model(
+        self,
+        cfg_model: DictConfig,
+        enable_activation_checkpointing: bool,
+        enable_activation_offloading: bool,
+        fsdp_cpu_offload: bool,
+        model_state_dict: Dict[str, Any],
+        custom_sharded_layers: Optional[List[str]] = None,
+    ) -> torch.nn.Module:
+        """
+        Model initialization has some important considerations:
+           a. To minimize GPU peak memory, we initialize the model on meta device with
+              the right dtype
+           b. All ranks calls ``load_state_dict`` without peaking CPU RAMs since
+              full state dicts are loaded with ``torch.load(mmap=True)``
+        """
+        if self._is_rank_zero:
+            self.logger.info(
+                "FSDP is enabled. Instantiating model and loading checkpoint on Rank 0..."
+            )
+
+        time_setup_start = time.perf_counter()
+
+        with training.set_default_dtype(self._dtype), torch.device("meta"):
+            model = config.instantiate(cfg_model)
+
+        if self._compile:
+            training.compile_model(model, verbose=self._is_rank_zero)
+
+        if enable_activation_checkpointing:
+            training.set_activation_checkpointing(
+                model, auto_wrap_policy={TransformerSelfAttentionLayer}
+            )
+
+        fsdp_shard_conditions = [
+            partial(training.get_shard_conditions, names_to_match=custom_sharded_layers)
+        ]
+        training.shard_model(
+            model=model,
+            shard_conditions=fsdp_shard_conditions,
+            cpu_offload=fsdp_cpu_offload,
+            reshard_after_forward=True,
+            dp_mesh=self.device_mesh,
+        )
+
+        with training.set_default_dtype(self._dtype), self._device:
+            for m in model.modules():
+                # RoPE is not covered in state dict
+                if hasattr(m, "rope_init"):
+                    m.rope_init()
+
+        # This method will convert the full model state dict into a sharded state
+        # dict and load into the model
+        training.load_from_full_model_state_dict(
+            model,
+            model_state_dict,
+            self._device,
+            strict=True,
+            cpu_offload=fsdp_cpu_offload,
+        )
+
+        if self._is_rank_zero:
+            self.logger.info(
+                f"Instantiating model and loading checkpoint took {time.perf_counter() - time_setup_start:.2f} secs"
+            )
+
+        self.activations_handling_ctx = training.get_act_offloading_ctx_manager(
+            model, enable_activation_offloading
+        )
+        training.validate_no_params_on_meta_device(model)
+
+        if self._is_rank_zero and self._log_peak_memory_stats:
+            memory_stats = training.get_memory_stats(device=self._device)
+            training.log_memory_stats(memory_stats)
+
+        disable_dropout(model)
+
+        # synchronize before training begins
+        torch.distributed.barrier(group=self.fsdp_group)
+        return model
+
+    def _setup_optimizer(
+        self, cfg_optimizer: DictConfig, opt_state_dict=None
+    ) -> torch.optim.Optimizer:
+        """Initialize the optimizer."""
+        optimizer = config.instantiate(cfg_optimizer, self._model.parameters())
+        if self._is_rank_zero:
+            self.logger.info("Optimizer is initialized.")
+        return optimizer
+
+    def grpo_step(
+        self,
+        trajectory: GRPOTrajectory,
+        context_length: int,
+    ) -> GRPOStats:
+        """Perform a single GRPO optimization step over a batch of trajectories and corresponding advantages and returns.
+
+        Args:
+            trajectory (GRPOTrajectory): a batch of trajectories
+            context_length (int): the length of the context window
+
+        Raises:
+            NotImplementedError: If the loss is not a LinearGRPOLoss.
+
+        Returns:
+            GRPOStats: Instance of :class:`~torchtune.rlhf.GRPOStats`
+        """
+        # Create an output mask to avoid computing model.output on tokens we won't train
+        # FIXME: when bsz>1, don't we have multiple context_length?
+        # FIXME: because of chunked CE, the outout of pi_logits is a chunked list, so masking after the fact is
+        # more annoying. Masking before the chunking is easier, but we have to figure out masking for bsz>1
+        output_mask = torch.zeros_like(
+            trajectory.query_responses, dtype=torch.bool, device=self._device
+        )
+        output_mask[:, context_length - 1 : -1] = True
+
+        # call model
+        with self.activations_handling_ctx:
+            outputs = self._model(
+                trajectory.query_responses,
+                input_pos=trajectory.position_ids,
+                mask=trajectory.masks,
+            )
+        bsz, _, dim = outputs.shape
+        outputs = outputs[output_mask]
+        outputs = outputs.reshape(bsz, -1, dim)
+        targets = trajectory.query_responses[:, context_length:]
+
+        if self.linear_loss:
+            weight = self._model.linear_projection_weight
+            # Compute GRPO loss
+            loss, policy_loss, kl_loss, ratios, clipfrac, pi_logprobs = self._loss_fn(
+                # pi_logits=pi_logits,
+                weight=weight,
+                outputs=outputs,
+                targets=targets,
+                ref_logprobs=trajectory.ref_logprobs,
+                advantages=trajectory.advantages,
+                padding_masks=~trajectory.response_padding_masks,
+            )
+        else:
+            raise NotImplementedError(
+                "We currently only support linear losses. Please use LinearGRPOLoss."
+            )
+
+        with torch.no_grad():
+            mask = ~trajectory.response_padding_masks  # True for non-padded tokens
+            approx_policy_kls = (
+                0.5 * ((pi_logprobs - trajectory.logprobs)[mask].pow(2)).mean()
+            )
+
+        # Handle trajectory return based on debug mode
+        metadata = {}
+        if self.debug_logging_enabled:
+            metadata["pi_logprobs"] = pi_logprobs.detach()
+
+        stats = GRPOStats(
+            loss=loss,
+            policy_loss=policy_loss,
+            kl_loss=kl_loss,
+            ratios=ratios,
+            clipfrac=clipfrac,
+            approx_policy_kls=approx_policy_kls,
+            metadata=metadata,
+        )
+
+        del outputs, pi_logprobs
+        torch.cuda.empty_cache()  # TODO: Test if this is needed
+        loss.backward()
+
+        return stats
+
+    def cleanup_after_step(
+        self, trajectory: GRPOTrajectory, l_grpo_stats: List[GRPOStats]
+    ) -> None:
+        """Clean up memory after a training step."""
+        for v in trajectory:
+            del v
+        del trajectory
+        for g in l_grpo_stats:
+            for v in g:
+                del v
+            del g
+        del l_grpo_stats
+
+    async def _log_metrics(
+        self,
+        step_idx,
+        trajectory,
+        grpo_stats,
+        total_step_time,
+        time_grpo_steps,
+        time_waiting_buffer,
+        time_weight_sync,
+        time_weight_gather,
+        number_of_tokens,
+        padded_tokens_percentage,
+        policy_age,
+        train_replay_buffer_size,
+    ):
+        """Log training metrics, only on rank zero."""
+        if not self._is_rank_zero:
+            return
+
+        # Stack list[GRPOStats]
+        tensor_fields = [
+            "loss",
+            "policy_loss",
+            "kl_loss",
+            "ratios",
+            "clipfrac",
+            "approx_policy_kls",
+        ]
+        grpo_stats_stacked = GRPOStats(
+            **{
+                field: torch.stack([getattr(stats, field) for stats in grpo_stats])
+                for field in tensor_fields
+            }
+        )
+
+        log_dict = {}
+        if self._log_peak_memory_stats:
+            memory_stats = training.get_memory_stats(device=self._device)
+            log_dict.update(
+                {
+                    f"train_worker_performance/memory/{k}": v
+                    for k, v in memory_stats.items()
+                }
+            )
+
+        log_dict.update(
+            {
+                "train_worker_training/loss": grpo_stats_stacked.loss.mean().item(),
+                "train_worker_training/policy_loss": grpo_stats_stacked.policy_loss.mean().item(),
+                "train_worker_training/num_stop_tokens": trajectory.response_padding_masks.any(
+                    -1
+                )
+                .sum()
+                .item(),
+                "train_worker_training/kl_loss": grpo_stats_stacked.kl_loss.mean().item(),
+                "train_worker_training/ratios": grpo_stats_stacked.ratios.mean().item(),
+                "train_worker_training/clipfrac": grpo_stats_stacked.clipfrac.mean().item(),
+                "train_worker_training/approx_policy_kls": grpo_stats_stacked.approx_policy_kls.mean().item(),
+                "train_worker_training/response_lengths": trajectory.seq_lens.float()
+                .mean()
+                .item(),
+            }
+        )
+
+        log_dict.update(
+            {
+                "train_worker_performance/total_step_time (s)": total_step_time,
+                "train_worker_performance/time_grpo_steps (s)": time_grpo_steps,
+                "train_worker_performance/pct_time_grpo_steps (%)": (
+                    time_grpo_steps / total_step_time * 100
+                    if total_step_time > 0
+                    else 0
+                ),
+                "train_worker_performance/tokens_per_second": (
+                    number_of_tokens / total_step_time if total_step_time > 0 else 0
+                ),
+                "train_worker_performance/time_weight_sync (s)": time_weight_sync,
+                "train_worker_performance/pct_time_weight_sync (%)": (
+                    time_weight_sync / total_step_time * 100
+                    if total_step_time > 0
+                    else 0
+                ),
+                "train_worker_performance/padded_tokens_percentage (%)": padded_tokens_percentage,
+                "train_worker_performance/time_waiting_buffer (s)": time_waiting_buffer,
+                "train_worker_performance/pct_time_waiting_buffer (%)": (
+                    time_waiting_buffer / total_step_time * 100
+                    if total_step_time > 0
+                    else 0
+                ),
+                "train_worker_performance/time_weight_gather (s)": time_weight_gather,
+                "train_worker_performance/pct_time_weight_gather (%)": (
+                    time_weight_gather / total_step_time * 100
+                    if total_step_time > 0
+                    else 0
+                ),
+                "queues/train_worker_policy_age_mean": policy_age,
+                "queues/train_replay_buffer_size": train_replay_buffer_size,
+            }
+        )
+
+        await self.metric_actor.log_dict(log_dict, step=step_idx).call()
+
+    async def _log_debug_table(
+        self,
+        grpo_trajectory: GRPOTrajectory,
+        grpo_stats: GRPOStats,
+        metadata: Dict[str, Any],
+        context_length: int,
+    ) -> None:
+        """
+        Log debugging tables to WandB with per-token and per-sample features using dictionaries.
+
+        ATTENTION:
+        - To see multiple tables in the logs check https://github.com/wandb/wandb/issues/6286#issuecomment-2734616342
+        - To visualize the columns in wandb, click on 'Columns' in the bottom right, then add them to the graph."
+
+        Args:
+            grpo_trajectory (GRPOTrajectory): Object containing sequence data (query_responses, logprobs, etc.).
+            grpo_stats (GRPOStats): Object with GRPO-related statistics (loss, policy_loss, etc.).
+            metadata (Dict[str, Any]): Dictionary containing rewards, successes, policy_version, etc.
+            context_length (int): Integer length of the prompt context.
+        """
+
+        async def _log_table(data: list, table_name: str) -> None:
+            """Helper function to log table data to WandB."""
+            if data:
+                self.logger.info(f"Logging {table_name} for step {self._steps_run}")
+                columns = list(data[0].keys())
+                table_data = []
+                for row in data:
+                    table_data.append([row[col] for col in columns])
+
+                await self.metric_actor.log_table(
+                    table_data, columns, table_name, step=self._steps_run
+                ).call()
+            else:
+                self.logger.info(
+                    f"Failed to log {table_name} for step {self._steps_run}"
+                )
+
+        # Determine the number of samples to log
+        num_samples = min(
+            self.debug_num_samples_per_step, grpo_trajectory.query_responses.size(0)
+        )
+
+        # Extract response tokens
+        targets = grpo_trajectory.query_responses[:, context_length:]
+        per_sample_table_data = []
+        per_token_table_data = []
+
+        # Iterate over each sample
+        for idx in range(num_samples):
+            func_names = metadata["reward_metadata"][idx]["func_names"]
+            sequence_id = metadata["sequence_ids"][idx]
+            seq_len = grpo_trajectory.seq_lens[idx].item()
+
+            prompt_tokens = grpo_trajectory.query_responses[
+                idx, :context_length
+            ].tolist()
+
+            response_tokens = grpo_trajectory.query_responses[
+                idx, context_length:
+            ].tolist()
+
+            prompt = self._tokenizer.decode(prompt_tokens, skip_special_tokens=False)
+            response = self._tokenizer.decode(
+                response_tokens, skip_special_tokens=False
+            )
+            decoded_tokens = [
+                self._tokenizer.decode([token], skip_special_tokens=False)
+                for token in response_tokens
+            ]
+
+            # Per-Sample Data
+            per_sample_dict = {}
+            per_sample_dict["Sequence ID"] = sequence_id
+            per_sample_dict["prompt"] = prompt
+            per_sample_dict["response"] = response
+            per_sample_dict["answers"] = grpo_trajectory.answers[idx]
+            per_sample_dict["policy_version"] = metadata["policy_version"][idx]
+
+            # Add rewards dynamically based on func_names
+            rewards = metadata["rewards"][idx].tolist()
+            for func_name, reward in zip(func_names, rewards):
+                per_sample_dict[f"reward_{func_name}"] = reward
+
+            # Add successes dynamically based on func_names
+            successes = metadata["successes"][idx].tolist()
+            for func_name, success in zip(func_names, successes):
+                per_sample_dict[f"success_{func_name}"] = success
+
+            # Add GRPO statistics, handling per-sample vs. scalar cases
+            # TODO: currently has one scalar per batch. We should enable a scalar per sentence.
+            # Need to refactor loss reduction to enable that.
+            stat_attrs = [
+                "loss",
+                "policy_loss",
+                "kl_loss",
+                "ratios",
+                "clipfrac",
+                "approx_policy_kls",
+            ]
+            for attr_name in stat_attrs:
+                stat = getattr(grpo_stats, attr_name)
+                per_sample_dict[attr_name] = (
+                    stat[idx].item() if stat.dim() > 0 else stat.item()
+                )
+
+            # Add advantages
+            per_sample_dict["advantages"] = grpo_trajectory.advantages[idx].item()
+
+            # Add sequence metrics
+            per_sample_dict["response_length"] = seq_len
+            per_sample_dict["context_length"] = context_length
+            per_sample_dict["has_stop_token"] = (
+                grpo_trajectory.response_padding_masks[idx].any().item()
+            )
+
+            # Check if prompt tokens are included in loss (should be 0)
+            per_sample_dict["prompt_masking_is_positive (should be 0)"] = (
+                grpo_trajectory.response_padding_masks[idx, :context_length]
+                .sum()
+                .item()
+            )
+
+            # Check if tokens beyond seq_len are included in loss (should be 0)
+            if context_length + seq_len < grpo_trajectory.query_responses.shape[1]:
+                beyond_seq_len = (
+                    grpo_trajectory.response_padding_masks[
+                        idx, context_length + seq_len :
+                    ]
+                    .sum()
+                    .item()
+                )
+            else:
+                beyond_seq_len = 0
+            per_sample_dict["beyond_seq_len_masking_is_positive (should be 0)"] = (
+                beyond_seq_len
+            )
+
+            per_sample_dict["num_tokens_response"] = seq_len
+            per_sample_dict["step"] = self._steps_run
+
+            # Append the dictionary to the per-sample table data
+            per_sample_table_data.append(per_sample_dict)
+
+            # Per-Token Data
+            for pos in range(seq_len):
+                per_token_dict = {}
+                per_token_dict["Sequence ID"] = sequence_id
+                per_token_dict["Token Position"] = pos  # TODO: maybe remove?
+                per_token_dict["Token ID"] = targets[idx, pos].item()
+                per_token_dict["Decoded Token"] = decoded_tokens[pos]
+                per_token_dict["generated_logprob"] = grpo_trajectory.logprobs[
+                    idx, pos
+                ].item()
+                per_token_dict["ref_logprob"] = grpo_trajectory.ref_logprobs[
+                    idx, pos
+                ].item()
+                per_token_dict["pi_logprob"] = (
+                    grpo_stats.metadata["pi_logprobs"][idx, pos].item()
+                    if grpo_stats.metadata
+                    else None
+                )
+                per_token_dict["abs_diff_pi_ref_logprob"] = abs(
+                    per_token_dict["pi_logprob"] - per_token_dict["ref_logprob"]
+                )
+                per_token_dict["abs_diff_pi_generated_logprob"] = abs(
+                    per_token_dict["pi_logprob"] - per_token_dict["generated_logprob"]
+                )
+                per_token_dict["mask"] = int(
+                    ~grpo_trajectory.response_padding_masks[idx, pos]
+                )
+                per_token_dict["step"] = self._steps_run
+
+                # Append the dictionary
+                per_token_table_data.append(per_token_dict)
+
+        # Log tables to WandB
+        await _log_table(per_sample_table_data, "per_sample_debug_table")
+        await _log_table(per_token_table_data, "per_token_debug_table")
+
+    @endpoint
+    async def run(self):
+        """Execute the GRPO training loop."""
+        with self._device:
+            self.logger = get_logger()
+            self.logger.info("Starting GRPO training loop...")
+            training.cleanup_before_training()
+            self._optimizer.zero_grad()
+            self._profiler.start()
+
+            while self._steps_run < self._total_dialog_turns:
+                # Memory profiling start
+                if (
+                    self._is_rank_zero
+                    and self.profiler_profile_memory
+                    and self._steps_run
+                    == self.profiler_wait_steps + self.profiler_warmup_steps
+                ):
+                    torch.cuda.memory._record_memory_history()
+
+                time_step_start = time.perf_counter()
+
+                # Fetch trajectory from queue
+                time_waiting_buffer_start = time.perf_counter()
+                train_replay_buffer_size = None
+                if self._is_rank_zero:
+                    train_replay_buffer_size = await self.replay_buffer.len().call()
+
+                num_waits = 0
+                while await self.replay_buffer.is_empty().call():
+                    if self._is_rank_zero and num_waits % 10 == 0:
+                        self.logger.info("waiting for replay buffer...")
+                    await asyncio.sleep(1.0)
+                    num_waits += 1
+
+                # TODO - batching?
+                trajectory = await self.replay_buffer.sample().call()
+                trajectory = trajectory.to(self._device)
+                time_waiting_buffer = time.perf_counter() - time_waiting_buffer_start
+                if self._is_rank_zero:
+                    self.logger.info(f"{self.local_rank=} got from queue traj {trajectory}")
+
+                # Prepare trajectory for optimization
+                prepared_trajectory, context_length, metadata = self._prepare_trajectory(
+                    trajectory
+                )
+
+                # Perform GRPO optimization
+                time_grpo_steps_start = time.perf_counter()
+                grpo_stats: list[GRPOStats] = []
+                for _ in range(self._ppo_epochs):
+                    # step
+                    step_stats = self.grpo_step(
+                        prepared_trajectory,
+                        context_length,
+                    )
+                    grpo_stats.append(step_stats)
+                    # grad norm
+                    if self._clip_grad_norm is not None:
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
+                            self._model.parameters(), max_norm=float(self._clip_grad_norm)
+                        )
+
+                    # optimizer step
+                    torch.distributed.barrier(group=self.fsdp_group)
+                    self._optimizer.step()
+                    torch.distributed.barrier(group=self.fsdp_group)
+                    self._optimizer.zero_grad(set_to_none=True)
+
+                    # scheduler
+                    self.global_step += 1
+                    if self._lr_scheduler is not None:
+                        self._lr_scheduler.step()
+
+                self.logger.info(f"{self.rank=} finished step {self._steps_run}")
+                time_grpo_steps = time.perf_counter() - time_grpo_steps_start
+                self._steps_run += 1
+
+                # Log debug table if enabled, using pi_logprobs from the first epoch
+                if (
+                    self.debug_logging_enabled
+                    and self._is_rank_zero
+                    and self._steps_run % self._log_every_n_steps == 0
+                ):
+                    await self._log_debug_table(
+                        prepared_trajectory, grpo_stats[0], metadata, context_length
+                    )
+
+                # Synchronize weights
+                time_weight_sync = time_weight_gather = 0
+                gathered_sd = None
+                if self._steps_run % self._steps_before_sync == 0:
+                    torch.distributed.barrier(group=self.fsdp_group)
+                    time_weight_gather_start = time.perf_counter()
+                    gathered_sd = {
+                        k: v.full_tensor() for k, v in self._model.state_dict().items()
+                    }
+                    torch.cuda.synchronize()
+                    time_weight_gather = time.perf_counter() - time_weight_gather_start
+                    if self._is_rank_zero:
+                        self.logger.info(f"Done gather in {time_weight_gather}")
+                    time_sync_start = time.perf_counter()
+                    self.sync_weights(gathered_sd)
+                    time_weight_sync = time.perf_counter() - time_sync_start
+                    if self._is_rank_zero:
+                        self.logger.info(f"Done sync in {time_weight_sync}")
+
+                # Log metrics
+                total_step_time = time.perf_counter() - time_step_start
+                if self._is_rank_zero and self._steps_run % self._log_every_n_steps == 0:
+                    self.logger.info("logging metrics")
+                    await self._log_metrics(
+                        step_idx=self.global_step,
+                        trajectory=prepared_trajectory,
+                        grpo_stats=grpo_stats,
+                        total_step_time=total_step_time,
+                        time_grpo_steps=time_grpo_steps,
+                        time_waiting_buffer=time_waiting_buffer,
+                        time_weight_sync=0,
+                        time_weight_gather=0,
+                        number_of_tokens=metadata["number_of_tokens"],
+                        padded_tokens_percentage=metadata["padded_tokens_percentage"],
+                        policy_age=metadata["avg_policy_age"],
+                        train_replay_buffer_size=train_replay_buffer_size,
+                    )
+                    self.logger.info("done logging metrics")
+
+                self.cleanup_after_step(trajectory, grpo_stats)
+
+                # Save a copy of the weights
+                if self._steps_run % self.save_every_n_steps == 0:
+                    if gathered_sd is None:
+                        gathered_sd = {
+                            k: v.full_tensor() for k, v in self._model.state_dict().items()
+                        }
+                    self._checkpointer.save_checkpoint(
+                        state_dict={training.MODEL_KEY: gathered_sd},
+                        epoch=0,
+                        step=self._steps_run,
+                    )
+                del gathered_sd
+
+                # Memory profiling stop
+                self._profiler.step()
+                if (
+                    self._is_rank_zero
+                    and self.profiler_profile_memory
+                    and self._steps_run
+                    == self.profiler_wait_steps
+                    + self.profiler_warmup_steps
+                    + self.profiler_active_steps
+                ):
+                    torch.cuda.memory._record_memory_history(enabled=None)
+
+                torch.distributed.barrier(group=self.fsdp_group)
+
+            self._profiler.stop()
+
+    def sync_weights(self, new_sd):
+        self.policy_version += 1
+        if self._is_rank_zero:
+            self.logger.info("fake sync weights")
+        # TODO - replace w/ rdmabuffer
+        # if self._is_rank_zero:
+        #     new_sd = qwen2_tune_to_hf(new_sd, num_heads=16, num_kv_heads=2, dim=2048)
+        #     ray.get(self.parameter_server.acquire_state_dict_lock.remote())
+        #     self.parameter_server.receive_from_trainer.remote()
+        #     for i, (k, v) in enumerate(new_sd.items()):
+        #         # dst is global rank, can switch to group_dst arg if not 2.5.1
+        #         torch.distributed.send(v, dst=self.world_size - 1)
+
+        #     ray.get(self.parameter_server.release_state_dict_lock.remote())
+
+    def _prepare_trajectory(
+        self, raw_trajectory: Trajectory
+    ) -> tuple[GRPOTrajectory, int, dict[str, Any]]:
+        """Processes raw trajectory, compute rewards, and prepare for optimization.
+
+        Args:
+            raw_trajectory (Trajectory): The trajectory sampled from the replay buffer.
+
+        Returns:
+            Tuple[trajectory, context_length, metadata]
+        """
+        # Extract components from raw trajectory
+        query_responses = raw_trajectory.query_responses
+        responses = raw_trajectory.responses
+        logprobs = raw_trajectory.logprobs
+        ref_logprobs = raw_trajectory.ref_logprobs
+        query_response_padding_masks = raw_trajectory.query_response_padding_masks
+        seq_lens = raw_trajectory.seq_lens
+        advantages = raw_trajectory.advantages
+        answers = raw_trajectory.answers
+
+        # Compute padded tokens percentage
+        total_tokens = query_responses.numel()
+        padded_tokens = (query_responses == self._tokenizer.pad_id).sum().item()
+        padded_tokens_percentage = (
+            (padded_tokens / total_tokens) * 100 if total_tokens > 0 else 0
+        )
+        number_of_tokens = seq_lens.sum().item()
+
+        # Truncate sequences at first stop token
+        response_padding_masks, responses = rlhf.truncate_sequence_at_first_stop_token(
+            responses,
+            torch.tensor(self._tokenizer.stop_tokens, device=self._device),
+            self._tokenizer.pad_id,
+        )
+
+        # Generate masks and position IDs
+        masks = generation.get_causal_mask_from_padding_mask(
+            query_response_padding_masks
+        )
+        position_ids = generation.get_position_ids_from_padding_mask(
+            query_response_padding_masks
+        )
+        context_length = query_responses.shape[1] - responses.shape[1]
+        del query_response_padding_masks
+
+        # Create GRPOTrajectory
+        prepared_trajectory = GRPOTrajectory(
+            query_responses=query_responses,
+            logprobs=logprobs,
+            ref_logprobs=ref_logprobs,
+            advantages=advantages,
+            masks=masks,
+            position_ids=position_ids,
+            response_padding_masks=response_padding_masks,
+            seq_lens=training.get_unmasked_sequence_lengths(response_padding_masks),
+            answers=answers,
+        )
+
+        # Metadata for logging
+        if isinstance(raw_trajectory.policy_version, list):
+            avg_policy_age = self.policy_version - (
+                sum(raw_trajectory.policy_version) / len(raw_trajectory.policy_version)
+            )
+        else:
+            avg_policy_age = self.policy_version - raw_trajectory.policy_version
+
+        metadata = {
+            "padded_tokens_percentage": padded_tokens_percentage,
+            "number_of_tokens": number_of_tokens,
+            "avg_policy_age": avg_policy_age,
+            "sequence_ids": raw_trajectory.sequence_ids,
+            "policy_version": raw_trajectory.policy_version,
+            "rewards": raw_trajectory.rewards,
+            "successes": raw_trajectory.successes,
+            "reward_metadata": raw_trajectory.reward_metadata,
+            "query_response_padding_masks": raw_trajectory.query_response_padding_masks,
+        }
+        return prepared_trajectory, context_length, metadata
+
+    def __repr__(self) -> str:
+        return f"TrainingActor([{self.local_rank}/{self.cfg.orchestration.num_training_workers})]"
+
+
 # ========= Recipe =========
 class MonarchGRPORecipe(OrchestrationRecipeInterface):
     async def setup(self, cfg: DictConfig) -> None:
@@ -967,6 +1892,9 @@ class MonarchGRPORecipe(OrchestrationRecipeInterface):
         )
         self.rollout_queue_actor = await self.singleton_proc_mesh.spawn(
             "queue", QueueActor
+        )
+        self.replay_buffer_actor = await self.singleton_proc_mesh.spawn(
+            "replay_buffer", ReplayBufferActor, cfg=cfg
         )
 
         # Create rollout actors and meshes
@@ -1018,14 +1946,28 @@ class MonarchGRPORecipe(OrchestrationRecipeInterface):
                     cfg=cfg,
                     metric_actor=self.metric_actor,
                     rollout_queue_actor=self.rollout_queue_actor,
+                    replay_buffer=self.replay_buffer_actor,
                 )
             )
 
-        self.all_actors = list(
-            itertools.chain(self.rollout_actor_meshes, self.postprocess_actor_meshes)
+        # Create training actors and meshes
+        training_shards = self.cfg.orchestration.num_training_workers
+        self.logger.info(f"[training] Creating mesh of size {training_shards}...")
+        self.training_mesh = await proc_mesh(gpus=training_shards)
+        self.training_actor = await self.training_mesh.spawn(
+            "training",
+            TrainingActor,
+            cfg=cfg,
+            metric_actor=self.metric_actor,
+            replay_buffer=self.replay_buffer_actor,
+            address=get_ip(),
+            port=get_open_port(),
         )
-        # self.all_actors = self.rollout_actor_meshes
-        # self.all_actors = self.postprocess_actor_meshes
+        self.all_actors = (
+            self.rollout_actor_meshes
+            + self.postprocess_actor_meshes
+            + [self.training_actor]
+        )
 
     async def run(self):
         self.logger.info("initializing actors")
