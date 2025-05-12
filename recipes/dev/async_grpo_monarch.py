@@ -68,8 +68,8 @@ class DisabledMetricsLoggerActor(Actor):
         pass
 
 
-class MetricLoggerActor(Actor):
-    """Metric logger for all actors."""
+class MetricsLoggerActor(Actor):
+    """Metrics logger for all actors."""
 
     def __init__(self, cfg):
         self.logger = config.instantiate(cfg.metric_logger)
@@ -598,7 +598,7 @@ class RolloutActor(Actor):
         self,
         global_rank: int,
         cfg: DictConfig,
-        metric_actor: MetricLoggerActor,
+        metric_actor: MetricsLoggerActor,
         rollout_queue_actor: QueueActor,
         reset_at_each_iter: bool = False,
         dialog_turns_per_batch: int = 1,
@@ -680,7 +680,7 @@ class PostProcessingActor(Actor):
         self,
         global_rank: int,
         cfg: DictConfig,
-        metric_actor: MetricLoggerActor,
+        metric_actor: MetricsLoggerActor,
         rollout_queue_actor: QueueActor,
         replay_buffer: ReplayBufferActor,
     ):
@@ -993,7 +993,7 @@ class TrainingActor(Actor):
     def __init__(
         self,
         cfg: DictConfig,
-        metric_actor: MetricLoggerActor,
+        metric_actor: MetricsLoggerActor,
         replay_buffer: ReplayBufferActor,
         address: str,
         port: str,
@@ -1888,7 +1888,7 @@ class MonarchGRPORecipe(OrchestrationRecipeInterface):
         # global entities (metric logger, queue) are spawned.
         self.singleton_proc_mesh = await proc_mesh(gpus=1, env={})
         self.metric_actor = await self.singleton_proc_mesh.spawn(
-            "metrics", DisabledMetricsLoggerActor, cfg=cfg
+            "metrics", MetricsLoggerActor, cfg=cfg
         )
         self.rollout_queue_actor = await self.singleton_proc_mesh.spawn(
             "queue", QueueActor
