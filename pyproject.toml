@@ -70,8 +70,8 @@ async_rl = [
     "tensordict @ git+https://github.com/pytorch/tensordict@c61d045aaadf6c0625706a3670fc6a741f31f1b0",
 
     # Regular PyPI dependencies
+    "aiorwlock",
     "ray",
-    "readerwriterlock",
     "vllm==0.8.4",
     "wandb",
 

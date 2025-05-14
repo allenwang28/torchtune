@@ -24,9 +24,16 @@ def stateless_init_process_group(
     from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
     from vllm.distributed.utils import StatelessProcessGroup
 
+    print(
+        "CABERNET! PROCESS GROUP INITIATED (host={}, port={}, rank={}, world_size={})".format(
+            master_address, master_port, rank, world_size
+        )
+    )
     pg = StatelessProcessGroup.create(
         host=master_address, port=master_port, rank=rank, world_size=world_size
     )
-
+    print("CABERNET! PROCESS GROUP CREATED: ", pg)
+    print("CABERNET! CREATING COMMUNICATOR! (pg={}, device={})".format(pg, device))
     pynccl = PyNcclCommunicator(pg, device=device)
+    print("CABERNET! COMMUNICATOR DONE!", pynccl)
     return pynccl

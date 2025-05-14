@@ -5,7 +5,9 @@ import os
 import time
 from functools import partial
 
-from typing import Any, Dict, Generic, List, Optional, TypeVar
+from typing import Any, Callable, Dict, Generic, List, Optional, TypeVar
+
+import aiorwlock
 
 import torch
 import torch.distributed
@@ -14,12 +16,15 @@ import torchtune.training as training
 from monarch.proc_mesh import proc_mesh
 from monarch.service import Actor, current_rank, current_size, endpoint
 from omegaconf import DictConfig, ListConfig, OmegaConf
-
 from tensordict import lazy_stack, NonTensorStack, TensorDict, TensorDictBase
 from tensordict.utils import expand_as_right
 from torchdata.stateful_dataloader import StatefulDataLoader
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
-from torchrl.collectors import SyncDataCollector
+from torchrl.collectors import (
+    SyncDataCollector,
+    WeightUpdateReceiverBase,
+    WeightUpdateSenderBase,
+)
 
 from torchrl.data import LazyStackStorage, ReplayBuffer
 from torchtune import config, generation, rlhf, utils
@@ -28,17 +33,32 @@ from torchtune.dev.rl.rewards import batched_rewards
 from torchtune.dev.rl.types import GRPOStats, GRPOTrajectory
 
 from torchtune.dev.rl.utils import stateless_init_process_group
+
+from torchtune.models.qwen2._convert_weights import qwen2_tune_to_hf
 from torchtune.modules.transformer import TransformerSelfAttentionLayer
 from torchtune.recipe_interfaces import OrchestrationRecipeInterface
 
 from torchtune.training import disable_dropout, DummyProfiler, PROFILER_KEY
-from vllm import LLM, SamplingParams
 from vllm.outputs import RequestOutput as vllmRequestOutput
-
-from vllm.utils import get_ip, get_open_port
+from vllm.utils import get_open_port
 from vllm.worker.worker import Worker
 
 T = TypeVar("T")
+
+
+def get_ip():
+    import socket
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # This doesn't actually establish a connection
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        return ip
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        s.close()
 
 
 # ========= Constants =========
@@ -156,7 +176,63 @@ def get_logger() -> logging.Logger:
     return logger
 
 
-# ========= Generic data structures =========
+# ========= Generic data structures + functionality =========
+def get_device_index(
+    entity: str, local_rank: int, global_rank: int, cfg: DictConfig
+) -> int:
+    """Returns the torch.device for the given entity/rank/config.
+
+    Maps logical entity ranks to physical GPU indices based on entity type and configuration.
+    For rollout workers, GPUs are assigned starting at index 0.
+    For postprocessing workers, GPUs are assigned after all rollout worker GPUs.
+
+    This is a placeholder implementation for now, and would need to change in a multi-host setting.
+    """
+    trainer_world_size = cfg.orchestration.num_training_workers
+    param_server_world_size = 1
+    rollout_world_size = (
+        cfg.inference.tensor_parallel_dim * cfg.orchestration.num_inference_workers
+    )
+    postprocessing_world_size = (
+        cfg.postprocessing.tensor_parallel_dim
+        * cfg.orchestration.num_postprocessing_workers
+    )
+    entity_world_size = -1
+
+    # if entity == "param_server":
+    #     entity_world_size = param_server_world_size
+    #     offset = 0
+    # elif entity == "rollout":
+    #     entity_world_size = rollout_world_size
+    #     offset = param_server_world_size
+    # elif entity == "postprocessing":
+    #     entity_world_size = postprocessing_world_size
+    #     offset = param_server_world_size + rollout_world_size
+    # elif entity == "training":
+    #     entity_world_size = trainer_world_size
+    #     offset = (
+    #         param_server_world_size + rollout_world_size + postprocessing_world_size
+    #     )
+    # else:
+    #     raise KeyError(f"Unknown entity: {entity}")
+
+    if entity == "param_server":
+        entity_world_size = param_server_world_size
+        offset = 0
+    elif entity == "training":
+        entity_world_size = trainer_world_size
+        offset = param_server_world_size
+    elif entity == "rollout":
+        entity_world_size = rollout_world_size
+        offset = trainer_world_size + param_server_world_size
+    elif entity == "postprocessing":
+        entity_world_size = postprocessing_world_size
+        offset = trainer_world_size + param_server_world_size + rollout_world_size
+    else:
+        raise KeyError(f"Unknown entity: {entity}")
+    return offset + global_rank * entity_world_size + local_rank
+
+
 class QueueActor(Actor, Generic[T]):
     def __init__(self):
         self.logger = get_logger()
@@ -181,11 +257,13 @@ class QueueActor(Actor, Generic[T]):
 
 
 class ReplayBufferActor(Actor):
-    def __init__(
-        self, cfg: DictConfig):
+    def __init__(self, cfg: DictConfig):
         self.rb = ReplayBuffer(
-            storage=partial(LazyStackStorage, max_size=cfg.orchestration.replay_buffer_size),
-            batch_size=cfg.training.batch_size)
+            storage=partial(
+                LazyStackStorage, max_size=cfg.orchestration.replay_buffer_size
+            ),
+            batch_size=cfg.training.batch_size,
+        )
         self.logger = get_logger()
 
     @endpoint
@@ -205,44 +283,298 @@ class ReplayBufferActor(Actor):
         return len(self.rb) == 0
 
 
-def get_device(
-    entity: str, local_rank: int, global_rank: int, cfg: DictConfig
-) -> torch.device:
-    """Returns the torch.device for the given entity/rank/config.
+# ========= Cabernet actors + data structures=========
+class ParameterServerActor(Actor):
+    def __init__(
+        self,
+        cfg: DictConfig,
+        vllm_master_addresses: list[str],
+        vllm_master_ports: list[int],
+        trainer_addr: str,
+        trainer_port: int,
+    ):
+        super().__init__()
+        self.cfg = cfg
+        self._vllm_master_addresses = vllm_master_addresses
+        self._vllm_master_ports = vllm_master_ports
+        self._trainer_addr = trainer_addr
+        self._trainer_port = trainer_port
+        self.vllm_comm_groups = dict()
+        self.vllm_weight_versions = dict()
+        self.vllm_worker_handles = dict()
+        self.logger = get_logger()
+        self.local_rank = current_rank()["gpus"]
 
-    Maps logical entity ranks to physical GPU indices based on entity type and configuration.
-    For rollout workers, GPUs are assigned starting at index 0.
-    For postprocessing workers, GPUs are assigned after all rollout worker GPUs.
+    @endpoint
+    async def initialize(self):
+        self.logger.info("Initializing parameter server...")
+        device_index = get_device_index("param_server", 0, 0, self.cfg)
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(device_index)
+        torch.cuda.set_device(torch.device("cuda", 0))
+        self.logger.info("device index: {}".format(device_index))
+        # Note: the parameter server facilitates comms between the trainers
+        # and generators. Here, we register the parameter server as
+        # a member of the trainer groups.
+        trainer_world_size = self.cfg.orchestration.num_training_workers
+        os.environ["RANK"] = str(0)
+        # world size = trainer world size + 1
+        os.environ["WORLD_SIZE"] = str(trainer_world_size + 1)
+        os.environ["MASTER_ADDR"] = str(self._trainer_addr)
+        os.environ["MASTER_PORT"] = str(self._trainer_port)
+        self.device = torch.device("cuda:0")
 
-    This is a placeholder implementation for now, and would need to change in a multi-host setting.
+        if not torch.distributed.is_initialized():
+            self.logger.info(
+                f"distributed init: rank: {os.environ['RANK']}, world_size: {os.environ['WORLD_SIZE']}, addr: {os.environ['MASTER_ADDR']}, port: {os.environ['MASTER_PORT']}"
+            )
+            torch.distributed.init_process_group(
+                backend="nccl", device_id=torch.device("cuda:0")
+            )
+
+        self.logger.info("done with distributed init")
+        self.rank = int(os.environ["RANK"])
+        self.world_size = int(os.environ["WORLD_SIZE"])
+        assert self.rank == 0
+        self.logger.info("loading checkpoint...")
+
+        # load the empty model / state dict
+        # Since we're broadcasting the trainer's weights, we can simply load
+        # the model definition using the same checkpointing mechanics as the trainer.
+        checkpointer = config.instantiate(
+            self.cfg.training.checkpointer, resume_from_checkpoint=False
+        )
+        self.state_dict = checkpointer.load_checkpoint()[training.MODEL_KEY]
+        self.logger.info("checkpoint loaded")
+        self.state_dict_lock = aiorwlock.RWLock()
+        self.version = 0
+        self.version_tensor = torch.tensor([0], device="cuda")
+
+        # Create model metadata
+        self.hf_state_dict = self._maybe_map_weights(self.state_dict)
+        self._model_metadata = {
+            k: (v.dtype, v.shape) for k, v in self.hf_state_dict.items()
+        }
+        self.logger.info("done with init")
+
+    @endpoint
+    async def acquire_write_lock(self):
+        await self.state_dict_lock.writer_lock.acquire()
+
+    @endpoint
+    async def release_write_lock(self):
+        self.version += 1
+        self.version_tensor += 1
+        torch.cuda.synchronize()
+        self.state_dict_lock.writer_lock.release()
+
+    def _get_server_weights(self):
+        return self.state_dict
+
+    def _maybe_map_weights(self, state_dict: dict[str, torch.Tensor]):
+        sd = qwen2_tune_to_hf(state_dict, num_heads=16, num_kv_heads=2, dim=2048)
+        for k, v in sd.items():
+            sd[k] = v.to(self.device)
+        return sd
+
+    @endpoint
+    async def skip_update(self, worker_id) -> bool:
+        if self.version == 0:
+            return True
+        if worker_id not in self.vllm_weight_versions:
+            return False
+        if self.vllm_weight_versions[worker_id] == self.version:
+            self.logger.info(
+                f"Skipping update for {worker_id=}, {self.version=}, {self.vllm_weight_versions[worker_id]=}"
+            )
+            return True
+        return False
+
+    def _init_model_update_group(self, worker_id):
+        vllm_tp_size = self.cfg.inference.tensor_parallel_dim
+        weight_sync_world_size = vllm_tp_size + 1
+        logger = get_logger()
+        logger.info(
+            "initializing model update group: addr: {}, port: {}, rank: {}, world_size: {}, device: {}, visible devices: {}".format(
+                self._vllm_master_addresses[worker_id],
+                self._vllm_master_ports[worker_id],
+                0,
+                weight_sync_world_size,
+                self.device,
+                os.environ.get("CUDA_VISIBLE_DEVICES", None),
+            )
+        )
+        model_update_group = stateless_init_process_group(
+            master_address=self._vllm_master_addresses[worker_id],
+            master_port=self._vllm_master_ports[worker_id],
+            rank=0,
+            world_size=weight_sync_world_size,
+            device=self.device,
+        )
+        logger.info("done initializing stateless process group")
+        self.vllm_comm_groups[worker_id] = model_update_group
+
+    @endpoint
+    async def sync_weights_with_worker(self, worker_id: int):
+        logger = get_logger()
+        # server_weights = self._maybe_map_weights(self._get_server_weights())
+        logger.info("syncing weights with worker {}".format(worker_id))
+        server_weights = self.hf_state_dict
+        if worker_id not in self.vllm_comm_groups:
+            self._init_model_update_group(worker_id)
+        logger.info("acquiring reader lock")
+        # TODO - this should be awaited, but for some reason that breaks a monarch assertion?
+        # await self.state_dict_lock.reader_lock.acquire()
+        # self.state_dict_lock.reader_lock.acquire()
+        logger.info("acquired!")
+        for i, k in enumerate(server_weights.keys()):
+            self.vllm_comm_groups[worker_id].broadcast(
+                server_weights[k], src=0, stream=torch.cuda.current_stream()
+            )
+        logger.info("broadcasting version")
+        self.vllm_comm_groups[worker_id].broadcast(
+            self.version_tensor, src=0, stream=torch.cuda.current_stream()
+        )
+        torch.cuda.synchronize()
+        self.vllm_weight_versions[worker_id] = self.version
+        # self.state_dict_lock.reader_lock.release()
+
+    @endpoint
+    async def receive_from_trainer(self):
+        for _, v in self.state_dict.items():
+            torch.distributed.recv(v, src=0)
+        # map to the huggingface state dict in place
+        torch.cuda.synchronize()
+        self.hf_state_dict = self._maybe_map_weights(self.state_dict)
+
+    @endpoint
+    async def get_model_metadata(self) -> dict[str, tuple[torch.Size, torch.Size]]:
+        return self._model_metadata
+
+    def __repr__(self) -> str:
+        return "ParameterServerActor"
+
+
+class VLLMHFWeightUpdateReceiver(WeightUpdateReceiverBase):
+    """A weight update receiver for vLLM / HuggingFace."""
+
+    def __init__(
+        self,
+        master_address: str,
+        master_port: int,
+        param_server: ParameterServerActor,
+        worker_idx,
+    ):
+        self.master_address = master_address
+        self.master_port = master_port
+        self.initialized_group = None
+        self.param_server = param_server
+        self.worker_idx = worker_idx
+        self.model_metadata = None
+
+    def _get_server_weights(self):
+        return None
+
+    def _get_local_weights(self):
+        # We don't implement this because we let vLLM's update_weights API handle everything for now
+        return None
+
+    def _maybe_map_weights(self, server_weights, local_weights):
+        # vLLM update_weights function handles the mapping from huggingface
+        # so we don't implement this for now
+        return None
+
+    async def update_weights2(self):
+        logger = get_logger()
+        if not self.model_metadata:
+            logger.info("getting model metadata")
+            self.model_metadata = await self.param_server.get_model_metadata().call()
+        logger.info("weight update receiver is updating weights")
+        should_update = await self.param_server.skip_update(self.worker_idx).call()
+        if should_update:
+            fut = self.param_server.sync_weights_with_worker(self.worker_idx).call()
+            inference_server = self.collector.inference_server
+            if self.initialized_group is None:
+                weight_sync_world_size = (
+                    inference_server.llm_engine.parallel_config.tensor_parallel_size + 1
+                )
+                inference_server.collective_rpc(
+                    "init_weight_update_group",
+                    args=(
+                        self.master_address,
+                        self.master_port,
+                        1,
+                        weight_sync_world_size,
+                    ),
+                )
+                self.initialized_group = True
+
+            for k, (dtype, shape) in self.model_metadata.items():
+                inference_server.collective_rpc("update_weight", args=(k, dtype, shape))
+
+            await fut
+            inference_server.collective_rpc("update_policy_version")
+        logger.info("weight update receiver is done updating weights")
+
+
+class VLLMWorkerWrapper(Worker):
     """
-    entity_world_size = -1
-    trainer_world_size = cfg.orchestration.num_training_workers
-    rollout_world_size = (
-        cfg.inference.tensor_parallel_dim * cfg.orchestration.num_inference_workers
-    )
-    postprocessing_world_size = (
-        cfg.postprocessing.tensor_parallel_dim
-        * cfg.orchestration.num_postprocessing_workers
-    )
+    vLLM worker for Ray.
 
-    if entity == "training":
-        entity_world_size = trainer_world_size
-        offset = 0
-    elif entity == "rollout":
-        entity_world_size = rollout_world_size
-        offset = trainer_world_size
-    elif entity == "postprocessing":
-        entity_world_size = postprocessing_world_size
-        offset = trainer_world_size + rollout_world_size
-    else:
-        raise KeyError(f"Unknown entity: {entity}")
+    vLLMParameterServer will always take rank 0 in the stateless process group
+    initialized by this worker. And the tp ranks associated with the LLM class
+    will be in the range [1, tp_size].
+    """
 
-    device_idx = offset + global_rank * entity_world_size + local_rank
-    return torch.device(f"cuda:{device_idx}")
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def init_weight_update_group(
+        self, master_address, master_port, rank_offset, world_size
+    ):
+        torch.cuda.set_device(self.device)
+        from vllm.distributed.parallel_state import get_world_group
+
+        rank = get_world_group().rank + rank_offset
+
+        logger = get_logger()
+        logger.info(
+            "initializing model update group: addr: {}, port: {}, rank: {}, world_size: {}, device: {}, visible devices: {}".format(
+                master_address,
+                master_port,
+                rank,
+                world_size,
+                self.device,
+                os.environ.get("CUDA_VISIBLE_DEVICES", None),
+            )
+        )
+        self._model_update_group = stateless_init_process_group(
+            master_address=master_address,
+            master_port=master_port,
+            rank=rank,
+            world_size=world_size,
+            device=self.device,
+        )
+        logger.info("done initializing stateless process group")
+        self.version = torch.tensor([0], device="cuda")
+
+    def update_weight(self, name, dtype, shape):
+        logger = get_logger()
+        weight = torch.empty(shape, dtype=dtype, device="cuda")
+        # src=0 because fsdp worker 0 has been assigned as "0" in this process group
+        self._model_update_group.broadcast(
+            weight, src=0, stream=torch.cuda.current_stream()
+        )
+        self.model_runner.model.load_weights(weights=[(name, weight)])
+        del weight
+
+    def update_policy_version(self):
+        self._model_update_group.broadcast(
+            self.version, src=0, stream=torch.cuda.current_stream()
+        )
+        self.policy_version = self.version
+        torch.cuda.synchronize()
 
 
-# ========= Cabernet actors =========
 class SyncLLMCollector(SyncDataCollector):
     """A synchronous data collector for LLM inference and trajectory collection.
 
@@ -264,6 +596,12 @@ class SyncLLMCollector(SyncDataCollector):
         reset_at_each_iter: bool = False,
         total_dialog_turns: int = -1,
         dialog_turns_per_batch: int = 1,
+        weight_update_receiver: (
+            WeightUpdateReceiverBase | Callable[[], WeightUpdateReceiverBase] | None
+        ) = None,
+        weight_update_sender: (
+            WeightUpdateSenderBase | Callable[[], WeightUpdateSenderBase] | None
+        ) = None,
     ):
         self.cfg = cfg
         self.reset_at_each_iter = reset_at_each_iter
@@ -272,11 +610,16 @@ class SyncLLMCollector(SyncDataCollector):
         self.logger = get_logger()
         self.local_rank = local_rank
         self.global_rank = global_rank
-        # Create data loader
+        device_index = get_device_index("rollout", local_rank, global_rank, cfg)
+        self.logger.info("device index: {}".format(device_index))
+        device = torch.device("cuda:{}".format(device_index))
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(device_index)
+        # torch.cuda.set_device(device)
+
         from torchtune import config
 
-        device = get_device("rollout", local_rank, global_rank, cfg)
         self._tokenizer = config.instantiate(self.cfg.tokenizer)
+        # Create data loader
         dataloader = self._setup_data(
             self.cfg.dataset,
             self.cfg.get("shuffle", True),
@@ -296,12 +639,14 @@ class SyncLLMCollector(SyncDataCollector):
             batch_size=self.cfg.inference.batch_size,
             repeats=self.cfg.inference.group_size,
         )
+        from vllm import LLM
+
         self.inference_server = LLM(
             model=self.cfg.inference.model,
             enforce_eager=True,
             enable_chunked_prefill=True,
             dtype="bfloat16",
-            # worker_cls=VLLMWorkerWrapper,
+            worker_cls=VLLMWorkerWrapper,
             tensor_parallel_size=self.cfg.inference.tensor_parallel_dim,
             device=device,
             **self.cfg.inference.get("engine_args", {}),
@@ -312,8 +657,8 @@ class SyncLLMCollector(SyncDataCollector):
             policy=self.policy_fn,  # TODO - is this needed at all?
             frames_per_batch=self.dialog_turns_per_batch,
             total_frames=self.total_dialog_turns,
-            weight_update_receiver=None,
-            weight_update_sender=None,
+            weight_update_receiver=weight_update_receiver,
+            weight_update_sender=weight_update_sender,
             reset_at_each_iter=self.reset_at_each_iter,
             use_buffers=False,
             device=device,
@@ -340,6 +685,8 @@ class SyncLLMCollector(SyncDataCollector):
                 - text_response: generated text strings
                 - log_probs: log probabilities of generated tokens
         """
+        from vllm import SamplingParams
+
         with self.device:
             start = time.perf_counter()
             text_input = data.get("text")
@@ -600,6 +947,9 @@ class RolloutActor(Actor):
         cfg: DictConfig,
         metric_actor: MetricsLoggerActor,
         rollout_queue_actor: QueueActor,
+        param_server: ParameterServerActor,
+        address: str,
+        port: int,
         reset_at_each_iter: bool = False,
         dialog_turns_per_batch: int = 1,
     ):
@@ -610,6 +960,9 @@ class RolloutActor(Actor):
         self.dialog_turns_per_batch = dialog_turns_per_batch
         self._metric_actor = metric_actor
         self._rollout_queue_actor = rollout_queue_actor
+        self._param_server = param_server
+        self._weight_update_receiver_address = address
+        self._weight_update_receiver_port = port
 
         # local_rank = parallelism rank within a distributed group
         self.local_rank = current_rank()["gpus"]
@@ -639,13 +992,21 @@ class RolloutActor(Actor):
         # The following env variables help guarantee GPU isolation
         gpu_indices = ",".join(str(idx) for idx in gpu_indices)
         os.environ["LOCAL_RANK"] = str(self.local_rank)
-        os.environ["CUDA_VISIBLE_DEVICES"] = gpu_indices
+        # os.environ["CUDA_VISIBLE_DEVICES"] = gpu_indices
+
+        weight_update_receiver = VLLMHFWeightUpdateReceiver(
+            master_address=self._weight_update_receiver_address,
+            master_port=self._weight_update_receiver_port,
+            param_server=self._param_server,
+            worker_idx=self.local_rank,
+        )
         self.collector = SyncLLMCollector(
             cfg=self.cfg,
             local_rank=self.local_rank,
             global_rank=self.global_rank,
             reset_at_each_iter=self.reset_at_each_iter,
             dialog_turns_per_batch=self.dialog_turns_per_batch,
+            weight_update_receiver=weight_update_receiver,
         )
         self.logger.info("done with init!")
 
@@ -658,6 +1019,13 @@ class RolloutActor(Actor):
         num_steps = 10
         for i in range(num_steps):
             # TODO - check for update
+            # if i > 0 and i % self.cfg.inference.steps_before_weight_sync == 0:
+            if i % self.cfg.inference.steps_before_weight_sync == 0:
+                self.logger.info("Updating weights...")
+                # self.collector.update_policy_weights_()
+                # TODO - workaround needed, since actor calls must be async
+                await self.collector.weight_update_receiver.update_weights2()
+
             self.logger.info(f"starting rollout for step {i}")
             trajectories, runtime_metrics = self.collector.rollout_step(
                 policy_version=0
@@ -697,9 +1065,12 @@ class PostProcessingActor(Actor):
     async def initialize(self):
         self.logger.info("initializing")
         self._tokenizer = config.instantiate(self.cfg.tokenizer)
-        self._device = get_device(
+        device_index = get_device_index(
             "postprocessing", self.local_rank, self.global_rank, self.cfg
         )
+        self.logger.info("device_index: {}".format(device_index))
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(device_index)
+        self._device = torch.device("cuda:{}".format(device_index))
         self._dtype = training.get_dtype("bf16", device=self._device)
         self._ref_model = self._build_reference_model()
         self._temperature = self.cfg.inference.temperature
@@ -954,6 +1325,7 @@ class PostProcessingActor(Actor):
                 trajectory = trajectory.cpu()
 
                 # Update circular queue
+                self.logger.info(f"extending replay buffer")
                 await self.replay_buffer.extend(trajectory).call()
 
                 # End of step timing
@@ -995,13 +1367,15 @@ class TrainingActor(Actor):
         cfg: DictConfig,
         metric_actor: MetricsLoggerActor,
         replay_buffer: ReplayBufferActor,
+        param_server: ParameterServerActor,
         address: str,
-        port: str,
+        port: int,
     ):
         self.cfg = cfg
         self.local_rank = current_rank()["gpus"]
         self.metric_actor = metric_actor
         self.replay_buffer = replay_buffer
+        self.param_server = param_server
         self.logger = get_logger()
         self._address = address
         self._port = port
@@ -1011,14 +1385,19 @@ class TrainingActor(Actor):
         self.logger.info("initializing trainer...")
 
         # Distributed training setup: Simulate torchrun environment
-        os.environ["RANK"] = str(self.local_rank)
-        os.environ["WORLD_SIZE"] = str(self.cfg.orchestration.num_training_workers)
-        os.environ["MASTER_ADDR"] = str(self._address)
-        os.environ["MASTER_PORT"] = str(self._port)
-        self._device = get_device(
+        # Note - we allocate an extra GPU for the parameter server.
+        # 1 index reserved by parameter server
+        # TODO - replace `get_device` with `get_device_idx`
+        device_index = get_device_index(
             entity="training", local_rank=self.local_rank, global_rank=0, cfg=self.cfg
         )
-        self._dtype = training.get_dtype("bf16", device=self._device)
+        self.logger.info("device index: {}".format(device_index))
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(device_index)
+        os.environ["RANK"] = str(self.local_rank + 1)
+        os.environ["WORLD_SIZE"] = str(self.cfg.orchestration.num_training_workers + 1)
+        os.environ["MASTER_ADDR"] = str(self._address)
+        os.environ["MASTER_PORT"] = str(self._port)
+
         self._output_dir = self.cfg.output_dir
         self._log_every_n_steps = self.cfg.get("log_every_n_steps", 1)
         self._log_peak_memory_stats = self.cfg.get("log_peak_memory_stats", True)
@@ -1028,12 +1407,20 @@ class TrainingActor(Actor):
             "cuda", offload_ops_to_cpu=self.fsdp_cpu_offload
         )
 
+        torch.cuda.set_device(device_index)
+
+        self.logger.info(
+            f"distributed init: rank: {os.environ['RANK']}, world_size: {os.environ['WORLD_SIZE']}, addr: {os.environ['MASTER_ADDR']}, port: {os.environ['MASTER_PORT']}, visible devices: {os.environ['CUDA_VISIBLE_DEVICES']}"
+        )
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(backend=self.distributed_backend)
 
         self.world_size = int(os.environ["WORLD_SIZE"])
+        ranks = list(range(1, self.world_size))
+        self.logger.info("ranks: %s", ranks)
         self.fsdp_group = torch.distributed.new_group(
-            ranks=list(range(self.world_size)), use_local_synchronization=True
+            ranks=ranks,
+            use_local_synchronization=True,
         )
         self.device_mesh = torch.distributed.device_mesh.DeviceMesh.from_group(
             self.fsdp_group, device_type="cuda"
@@ -1059,8 +1446,9 @@ class TrainingActor(Actor):
                 "enable_activation_offloading should only be True when enable_activation_checkpointing is True"
             )
 
+        self._device = torch.device("cuda:{}".format(device_index))
+        self._dtype = training.get_dtype("bf16", device=self._device)
         # Recipe state
-        # torch.cuda.set_device(self._device)
         # self.seed = training.set_seed(seed=self.cfg.training.seed)
         self.global_step = 0
         self._steps_run = 0
@@ -1080,9 +1468,7 @@ class TrainingActor(Actor):
             cfg_model=self.cfg.model,
             enable_activation_checkpointing=self._enable_activation_checkpointing,
             enable_activation_offloading=self._enable_activation_offloading,
-            custom_sharded_layers=self.cfg.training.get(
-                "custom_sharded_layers", None
-            ),
+            custom_sharded_layers=self.cfg.training.get("custom_sharded_layers", None),
             fsdp_cpu_offload=self.fsdp_cpu_offload,
             model_state_dict=checkpoint_dict[training.MODEL_KEY],
         )
@@ -1114,9 +1500,7 @@ class TrainingActor(Actor):
 
         # Debugging configuration
         self.debug_logging_enabled = self.cfg.get("debug_logging_enabled", True)
-        self.debug_num_samples_per_step = self.cfg.get(
-            "debug_num_samples_per_step", 2
-        )
+        self.debug_num_samples_per_step = self.cfg.get("debug_num_samples_per_step", 2)
         self.logger.info("done with init")
 
     def _setup_profiler(
@@ -1623,10 +2007,12 @@ class TrainingActor(Actor):
             self.logger = get_logger()
             self.logger.info("Starting GRPO training loop...")
             training.cleanup_before_training()
+            self.logger.info("cleaned up")
             self._optimizer.zero_grad()
             self._profiler.start()
 
             while self._steps_run < self._total_dialog_turns:
+                self.logger.info("mem profile")
                 # Memory profiling start
                 if (
                     self._is_rank_zero
@@ -1642,6 +2028,7 @@ class TrainingActor(Actor):
                 time_waiting_buffer_start = time.perf_counter()
                 train_replay_buffer_size = None
                 if self._is_rank_zero:
+                    self.logger.info("fetching from buffer")
                     train_replay_buffer_size = await self.replay_buffer.len().call()
 
                 num_waits = 0
@@ -1656,11 +2043,13 @@ class TrainingActor(Actor):
                 trajectory = trajectory.to(self._device)
                 time_waiting_buffer = time.perf_counter() - time_waiting_buffer_start
                 if self._is_rank_zero:
-                    self.logger.info(f"{self.local_rank=} got from queue traj {trajectory}")
+                    self.logger.info(
+                        f"{self.local_rank=} got from queue traj {trajectory}"
+                    )
 
                 # Prepare trajectory for optimization
-                prepared_trajectory, context_length, metadata = self._prepare_trajectory(
-                    trajectory
+                prepared_trajectory, context_length, metadata = (
+                    self._prepare_trajectory(trajectory)
                 )
 
                 # Perform GRPO optimization
@@ -1676,7 +2065,8 @@ class TrainingActor(Actor):
                     # grad norm
                     if self._clip_grad_norm is not None:
                         grad_norm = torch.nn.utils.clip_grad_norm_(
-                            self._model.parameters(), max_norm=float(self._clip_grad_norm)
+                            self._model.parameters(),
+                            max_norm=float(self._clip_grad_norm),
                         )
 
                     # optimizer step
@@ -1690,7 +2080,7 @@ class TrainingActor(Actor):
                     if self._lr_scheduler is not None:
                         self._lr_scheduler.step()
 
-                self.logger.info(f"{self.rank=} finished step {self._steps_run}")
+                self.logger.info(f"{self.local_rank=} finished step {self._steps_run}")
                 time_grpo_steps = time.perf_counter() - time_grpo_steps_start
                 self._steps_run += 1
 
@@ -1718,14 +2108,17 @@ class TrainingActor(Actor):
                     if self._is_rank_zero:
                         self.logger.info(f"Done gather in {time_weight_gather}")
                     time_sync_start = time.perf_counter()
-                    self.sync_weights(gathered_sd)
+                    await self.sync_weights(gathered_sd)
                     time_weight_sync = time.perf_counter() - time_sync_start
                     if self._is_rank_zero:
                         self.logger.info(f"Done sync in {time_weight_sync}")
 
                 # Log metrics
                 total_step_time = time.perf_counter() - time_step_start
-                if self._is_rank_zero and self._steps_run % self._log_every_n_steps == 0:
+                if (
+                    self._is_rank_zero
+                    and self._steps_run % self._log_every_n_steps == 0
+                ):
                     self.logger.info("logging metrics")
                     await self._log_metrics(
                         step_idx=self.global_step,
@@ -1749,7 +2142,8 @@ class TrainingActor(Actor):
                 if self._steps_run % self.save_every_n_steps == 0:
                     if gathered_sd is None:
                         gathered_sd = {
-                            k: v.full_tensor() for k, v in self._model.state_dict().items()
+                            k: v.full_tensor()
+                            for k, v in self._model.state_dict().items()
                         }
                     self._checkpointer.save_checkpoint(
                         state_dict={training.MODEL_KEY: gathered_sd},
@@ -1774,20 +2168,17 @@ class TrainingActor(Actor):
 
             self._profiler.stop()
 
-    def sync_weights(self, new_sd):
+    async def sync_weights(self, new_sd):
         self.policy_version += 1
-        if self._is_rank_zero:
-            self.logger.info("fake sync weights")
+        self.logger.info("syncing weights at {}".format(self.policy_version))
         # TODO - replace w/ rdmabuffer
-        # if self._is_rank_zero:
-        #     new_sd = qwen2_tune_to_hf(new_sd, num_heads=16, num_kv_heads=2, dim=2048)
-        #     ray.get(self.parameter_server.acquire_state_dict_lock.remote())
-        #     self.parameter_server.receive_from_trainer.remote()
-        #     for i, (k, v) in enumerate(new_sd.items()):
-        #         # dst is global rank, can switch to group_dst arg if not 2.5.1
-        #         torch.distributed.send(v, dst=self.world_size - 1)
-
-        #     ray.get(self.parameter_server.release_state_dict_lock.remote())
+        if self._is_rank_zero:
+            await self.param_server.acquire_write_lock().call()
+            await self.param_server.receive_from_trainer().call()
+            for i, (k, v) in enumerate(new_sd.items()):
+                # dst is global rank, can switch to group_dst arg if not 2.5.1
+                torch.distributed.send(v, dst=self.world_size - 1)
+            await self.param_server.release_write_lock().call()
 
     def _prepare_trajectory(
         self, raw_trajectory: Trajectory
@@ -1884,32 +2275,82 @@ class MonarchGRPORecipe(OrchestrationRecipeInterface):
         self.num_postprocessing_workers = cfg.orchestration.num_postprocessing_workers
         self.num_training_workers = cfg.orchestration.num_training_workers
 
+        # We want to create distributed groups for:
+        # 1) all rollout workers and
+        # 2) trainers
+        addresses = [get_ip() for _ in range(self.num_inference_workers + 1)]
+        # addresses = ["localhost" for _ in range(self.num_inference_workers + 1)]
+        ports = [get_open_port() for _ in range(self.num_inference_workers + 1)]
+        self.logger.info("addresses: {}".format(addresses))
+        self.logger.info("ports: {}".format(ports))
+        trainer_address = addresses[0]
+        trainer_port = ports[0]
+        vllm_addresses = addresses[1:]
+        vllm_ports = ports[1:]
+
         # singleton_proc_mesh is the designated proc where
         # global entities (metric logger, queue) are spawned.
-        self.singleton_proc_mesh = await proc_mesh(gpus=1, env={})
+        # TODO - consider splitting these into their own procs
+        self.singleton_proc_mesh = await proc_mesh(
+            gpus=1,
+            env={
+                "NCCL_DEBUG": "INFO",
+                "CUDA_LAUNCH_BLOCKING": "1",
+                "NCCL_DEBUG_SUBSYS": "ALL",
+                "NCCL_P2P_DISABLE": "1",
+            },
+        )
+        self.logger.info("spawning metric actor")
         self.metric_actor = await self.singleton_proc_mesh.spawn(
             "metrics", MetricsLoggerActor, cfg=cfg
         )
+        self.logger.info("spawning rollout actor")
         self.rollout_queue_actor = await self.singleton_proc_mesh.spawn(
             "queue", QueueActor
         )
+        self.logger.info("spawning replay buffer actor")
         self.replay_buffer_actor = await self.singleton_proc_mesh.spawn(
             "replay_buffer", ReplayBufferActor, cfg=cfg
         )
+        self.logger.info("spawning param server actor")
 
+        self.param_server_proc_mesh = await proc_mesh(
+            gpus=1,
+            env={
+                "NCCL_DEBUG": "INFO",
+                "CUDA_LAUNCH_BLOCKING": "1",
+                "NCCL_DEBUG_SUBSYS": "ALL",
+                "NCCL_P2P_DISABLE": "1",
+            },
+        )
+        self.param_server_actor = await self.param_server_proc_mesh.spawn(
+            "param_server",
+            ParameterServerActor,
+            cfg=cfg,
+            vllm_master_addresses=vllm_addresses,
+            vllm_master_ports=vllm_ports,
+            trainer_addr=trainer_address,
+            trainer_port=trainer_port,
+        )
         # Create rollout actors and meshes
         self.rollout_proc_meshes = []
         self.rollout_actor_meshes = []
-
+        self.weight_updater_actors = []
         inference_tp = cfg.inference.tensor_parallel_dim
+
         self.logger.info(
-            f"Creating {self.num_inference_workers} meshes of size {inference_tp}..."
+            f"[rollout] Creating {self.num_inference_workers} meshes of size {inference_tp}..."
         )
         for i in range(self.num_inference_workers):
             self.rollout_proc_meshes.append(
                 await proc_mesh(
                     gpus=inference_tp,
-                    env={},
+                    env={
+                        "NCCL_DEBUG": "INFO",
+                        "CUDA_LAUNCH_BLOCKING": "1",
+                        "NCCL_DEBUG_SUBSYS": "ALL",
+                        "NCCL_P2P_DISABLE": "1",
+                    },
                 )
             )
             self.rollout_actor_meshes.append(
@@ -1918,8 +2359,11 @@ class MonarchGRPORecipe(OrchestrationRecipeInterface):
                     RolloutActor,
                     global_rank=i,
                     cfg=cfg,
+                    address=vllm_addresses[i],
+                    port=vllm_ports[i],
                     metric_actor=self.metric_actor,
                     rollout_queue_actor=self.rollout_queue_actor,
+                    param_server=self.param_server_actor,
                 )
             )
 
@@ -1929,13 +2373,18 @@ class MonarchGRPORecipe(OrchestrationRecipeInterface):
 
         postprocess_tp = self.cfg.postprocessing.tensor_parallel_dim
         self.logger.info(
-            f"Creating {self.num_postprocessing_workers} meshes of size {postprocess_tp}..."
+            f"[postprocess] Creating {self.num_postprocessing_workers} meshes of size {postprocess_tp}..."
         )
         for i in range(self.num_postprocessing_workers):
             self.postprocess_proc_meshes.append(
                 await proc_mesh(
                     gpus=postprocess_tp,
-                    env={},
+                    env={
+                        "NCCL_DEBUG": "INFO",
+                        "CUDA_LAUNCH_BLOCKING": "1",
+                        "NCCL_DEBUG_SUBSYS": "ALL",
+                        "NCCL_P2P_DISABLE": "1",
+                    },
                 )
             )
             self.postprocess_actor_meshes.append(
@@ -1953,16 +2402,26 @@ class MonarchGRPORecipe(OrchestrationRecipeInterface):
         # Create training actors and meshes
         training_shards = self.cfg.orchestration.num_training_workers
         self.logger.info(f"[training] Creating mesh of size {training_shards}...")
-        self.training_mesh = await proc_mesh(gpus=training_shards)
+        self.training_mesh = await proc_mesh(
+            gpus=training_shards,
+            env={
+                "NCCL_DEBUG": "INFO",
+                "CUDA_LAUNCH_BLOCKING": "1",
+                "NCCL_DEBUG_SUBSYS": "ALL",
+                "NCCL_P2P_DISABLE": "1",
+            },
+        )
         self.training_actor = await self.training_mesh.spawn(
             "training",
             TrainingActor,
             cfg=cfg,
             metric_actor=self.metric_actor,
             replay_buffer=self.replay_buffer_actor,
-            address=get_ip(),
-            port=get_open_port(),
+            param_server=self.param_server_actor,
+            address=trainer_address,
+            port=trainer_port,
         )
+
         self.all_actors = (
             self.rollout_actor_meshes
             + self.postprocess_actor_meshes
@@ -1972,7 +2431,10 @@ class MonarchGRPORecipe(OrchestrationRecipeInterface):
     async def run(self):
         self.logger.info("initializing actors")
         await asyncio.gather(
-            *[a.initialize().broadcast_and_wait() for a in self.all_actors]
+            *[
+                a.initialize().broadcast_and_wait()
+                for a in self.all_actors + [self.param_server_actor]
+            ]
         )
         self.logger.info("running actors")
         await asyncio.gather(*[a.run().broadcast_and_wait() for a in self.all_actors])
