@@ -68,26 +68,6 @@ _LOG_PROBS_KEY = "log_probs"
 
 
 # ========= Logging related components =========
-class DisabledMetricsLoggerActor(Actor):
-    """For developing quickly (skip the wandb init overhead)"""
-
-    def __init__(self, cfg):
-        pass
-
-    @endpoint
-    async def log_dict(self, log_dict, step=None):
-        logger = get_logger()
-        logger.info("logging %s at step %s", log_dict, step)
-
-    @endpoint
-    async def log_table(self, table_data, columns, table_name, step=None):
-        pass
-
-    @endpoint
-    async def close(self):
-        pass
-
-
 class MetricsLoggerActor(Actor):
     """Metrics logger for all actors."""
 
@@ -189,14 +169,19 @@ def get_device_index(
     This is a placeholder implementation for now, and would need to change in a multi-host setting.
     """
     trainer_world_size = cfg.orchestration.num_training_workers
+    trainer_offset = trainer_world_size
+
     param_server_world_size = 1
-    rollout_world_size = (
-        cfg.inference.tensor_parallel_dim * cfg.orchestration.num_inference_workers
-    )
-    postprocessing_world_size = (
-        cfg.postprocessing.tensor_parallel_dim
-        * cfg.orchestration.num_postprocessing_workers
-    )
+    param_server_offset = param_server_world_size
+
+    rollout_world_size = cfg.inference.tensor_parallel_dim
+    num_rollout_workers = cfg.orchestration.num_inference_workers
+    rollout_offset = rollout_world_size * num_rollout_workers
+
+    postprocessing_world_size = cfg.postprocessing.tensor_parallel_dim
+    num_postprocessing_workers = cfg.orchestration.num_postprocessing_workers
+    postprocessing_offset = postprocessing_world_size * num_postprocessing_workers
+
     entity_world_size = -1
 
     if entity == "param_server":
@@ -204,13 +189,13 @@ def get_device_index(
         offset = 0
     elif entity == "training":
         entity_world_size = trainer_world_size
-        offset = param_server_world_size
+        offset = param_server_offset
     elif entity == "rollout":
         entity_world_size = rollout_world_size
-        offset = trainer_world_size + param_server_world_size
+        offset = trainer_offset + param_server_offset
     elif entity == "postprocessing":
         entity_world_size = postprocessing_world_size
-        offset = trainer_world_size + param_server_world_size + rollout_world_size
+        offset = trainer_offset + param_server_offset + rollout_offset
     else:
         raise KeyError(f"Unknown entity: {entity}")
     return offset + global_rank * entity_world_size + local_rank
@@ -306,11 +291,7 @@ class ParameterServerActor(Actor):
         torch.cuda.set_device(self.device)
 
         if not torch.distributed.is_initialized():
-            self.logger.info(
-                f"distributed init: rank: {os.environ['RANK']}, world_size: {os.environ['WORLD_SIZE']}, addr: {os.environ['MASTER_ADDR']}, port: {os.environ['MASTER_PORT']}"
-            )
             torch.distributed.init_process_group(backend="nccl", rank=0)
-        self.logger.info("done with distributed init")
         self.rank = int(os.environ["RANK"])
         self.world_size = int(os.environ["WORLD_SIZE"])
         assert self.rank == 0
@@ -343,9 +324,6 @@ class ParameterServerActor(Actor):
 
     @endpoint
     async def acquire_write_lock(self):
-        # TODO - This sleep is a workaround for a Monarch assertion failure I don't quite understand
-        self.logger.info("writer lock acquired")
-        await asyncio.sleep(1.0)
         await self.state_dict_lock.acquire()
 
     @endpoint
@@ -354,7 +332,6 @@ class ParameterServerActor(Actor):
         self.version_tensor += 1
         torch.cuda.synchronize()
         self.state_dict_lock.release()
-        self.logger.info("writer lock released")
 
     def _get_server_weights(self):
         return self.state_dict
@@ -364,6 +341,10 @@ class ParameterServerActor(Actor):
         for k, v in sd.items():
             sd[k] = v.to(self.device)
         return sd
+
+    @endpoint
+    async def current_policy_version(self) -> int:
+        return self.version
 
     @endpoint
     async def skip_update(self, worker_id) -> bool:
@@ -399,7 +380,6 @@ class ParameterServerActor(Actor):
             world_size=weight_sync_world_size,
             device=self.device,
         )
-        logger.info("done initializing stateless process group")
         self.vllm_comm_groups[worker_id] = model_update_group
 
     @endpoint
@@ -410,36 +390,30 @@ class ParameterServerActor(Actor):
         server_weights = self.hf_state_dict
         if worker_id not in self.vllm_comm_groups:
             self._init_model_update_group(worker_id)
-        logger.info("acquiring reader lock")
-        # TODO - This sleep is a workaround for a Monarch assertion failure I don't quite understand
-        await asyncio.sleep(1)
         await self.state_dict_lock.acquire()
-        logger.info("acquired!")
-        for i, k in enumerate(server_weights.keys()):
+        logger.info("acquired dict!")
+        for i, k in enumerate(sorted(server_weights.keys())):
+            self.logger.info("broadcast {}".format(k))
             self.vllm_comm_groups[worker_id].broadcast(
                 server_weights[k], src=0, stream=torch.cuda.current_stream()
             )
-        logger.info("broadcasting version")
         self.vllm_comm_groups[worker_id].broadcast(
             self.version_tensor, src=0, stream=torch.cuda.current_stream()
         )
         torch.cuda.synchronize()
         self.vllm_weight_versions[worker_id] = self.version
         self.state_dict_lock.release()
+        self.logger.info("done syncing weights with worker {}".format(worker_id))
 
     @endpoint
     async def receive_from_trainer(self):
-        # self.logger.info("receiving from trainer (dict: {})".format(self.state_dict))
-        # self.logger.info("{} receiving from trainer. keys: {}".format(self.rank, self.state_dict.keys()))
+        self.logger.info("receiving weights from trainer")
         for k in sorted(self.state_dict.keys()):
             v = self.state_dict[k]
-            # self.logger.info("{} receiving {}".format(self.rank, k))
             torch.distributed.recv(v, src=1)
-        self.logger.info("receives queued, barrier")
         torch.distributed.barrier()
-        # map to the huggingface state dict in place
         self.hf_state_dict = self._maybe_map_weights(self.state_dict)
-        self.logger.info("done updating weights")
+        self.logger.info("done receiving weights from trainer")
 
     @endpoint
     async def get_model_metadata(self) -> dict[str, tuple[torch.Size, torch.Size]]:
@@ -479,11 +453,8 @@ class VLLMHFWeightUpdateReceiver(WeightUpdateReceiverBase):
         return None
 
     async def update_weights2(self):
-        logger = get_logger()
         if not self.model_metadata:
-            logger.info("getting model metadata")
             self.model_metadata = await self.param_server.get_model_metadata().call()
-        logger.info("weight update receiver is updating weights")
         should_update = await self.param_server.skip_update(self.worker_idx).call()
         if should_update:
             fut = self.param_server.sync_weights_with_worker(self.worker_idx).call()
@@ -503,12 +474,14 @@ class VLLMHFWeightUpdateReceiver(WeightUpdateReceiverBase):
                 )
                 self.initialized_group = True
 
-            for k, (dtype, shape) in self.model_metadata.items():
+            logger = get_logger()
+            for k in sorted(self.model_metadata.keys()):
+                dtype, shape = self.model_metadata[k]
+                logger.info("broadcast: {}".format(k))
                 inference_server.collective_rpc("update_weight", args=(k, dtype, shape))
 
             await fut
             inference_server.collective_rpc("update_policy_version")
-        logger.info("weight update receiver is done updating weights")
 
 
 class VLLMWorkerWrapper(Worker):
@@ -843,16 +816,13 @@ class SyncLLMCollector(SyncDataCollector):
         results_td: TensorDict = lazy_stack(trajectories, -1)
         return results_td
 
-    def rollout_step(self, policy_version: int) -> tuple[Trajectory, dict[str, float]]:
+    def rollout_step(self) -> tuple[Trajectory, dict[str, float]]:
         """Executes a rollout and processes the results into a standardized format.
 
         This method extends the base rollout functionality by:
         1. Converting raw TensorDict trajectories into a structured Trajectory object
         2. Computing sequence lengths and generating unique sequence IDs
         3. Tracking performance metrics (generation time, memory usage, etc.)
-
-        Args:
-            policy_version: Version identifier for the policy being used
 
         Returns:
             Tuple containing:
@@ -885,6 +855,12 @@ class SyncLLMCollector(SyncDataCollector):
                 for i in range(batch_size)
             ]
         )
+
+        policy_version = getattr(
+            self.inference_server.llm_engine.model_executor.driver_worker.worker,
+            "policy_version",
+            torch.tensor([0]),
+        ).item()
         total_generated_tokens = seq_lens.sum().item()
 
         trajectory = Trajectory(
@@ -1012,26 +988,26 @@ class RolloutActor(Actor):
         self.logger = get_logger()
         self.logger.info("Running rollout actor...")
 
-        num_steps = 10
-        for i in range(num_steps):
-            # TODO - check for update
-            if i > 0 and i % self.cfg.inference.steps_before_weight_sync == 0:
-                # if i % self.cfg.inference.steps_before_weight_sync == 0:
+        i = 0
+        while True:
+            ps_version = await self._param_server.current_policy_version().call()
+            current_policy = getattr(
+                self.collector.inference_server.llm_engine.model_executor.driver_worker.worker,
+                "policy_version",
+                torch.tensor([0]),
+            ).item()
+            if ps_version != current_policy:
                 self.logger.info("Updating weights...")
-                # TODO - workaround needed, since actor calls must be async
                 await self.collector.weight_update_receiver.update_weights2()
 
             self.logger.info(f"starting rollout for step {i}")
-            trajectories, runtime_metrics = self.collector.rollout_step(
-                policy_version=0
-            )
-            await self._metric_actor.log_dict(runtime_metrics).call()
+            trajectories, runtime_metrics = self.collector.rollout_step()
+            await self._metric_actor.log_dict(runtime_metrics, step=i).call()
             # TODO - the first rollout step triggers vLLM initialization which should not be necessary.
             # We should be able to avoid this, but needs further investigation.
             # TODO - time the push to queue time?
-            self.logger.info("pushing to queue")
             await self._rollout_queue_actor.put(trajectories).call()
-            self.logger.info("done pushing to queue")
+            i += 1
 
     def __repr__(self) -> str:
         return f"RolloutActor(global={self.global_rank}/{self.cfg.orchestration.num_inference_workers})[local={self.local_rank}/{self.cfg.inference.tensor_parallel_dim})]"
@@ -1108,7 +1084,6 @@ class PostProcessingActor(Actor):
         # Ensure no params and buffers are on meta device
         training.validate_no_params_on_meta_device(ref_model)
         disable_dropout(ref_model)
-        self.logger.info("done setting up ref model")
         return ref_model
 
     async def _log_metrics(
@@ -1321,7 +1296,7 @@ class PostProcessingActor(Actor):
                 trajectory = trajectory.cpu()
 
                 # Update circular queue
-                self.logger.info(f"extending replay buffer")
+                self.logger.info("extending replay buffer")
                 await self.replay_buffer.extend(trajectory).call()
 
                 # End of step timing
@@ -1417,7 +1392,6 @@ class TrainingActor(Actor):
         self.rank = int(os.environ["RANK"])
         self.world_size = int(os.environ["WORLD_SIZE"])
         ranks = list(range(1, self.world_size))
-        self.logger.info("ranks: %s", ranks)
         self.fsdp_group = torch.distributed.new_group(
             ranks=ranks,
             use_local_synchronization=True,
@@ -2115,7 +2089,6 @@ class TrainingActor(Actor):
                     self._is_rank_zero
                     and self._steps_run % self._log_every_n_steps == 0
                 ):
-                    self.logger.info("logging metrics")
                     await self._log_metrics(
                         step_idx=self.global_step,
                         trajectory=prepared_trajectory,
@@ -2130,7 +2103,6 @@ class TrainingActor(Actor):
                         policy_age=metadata["avg_policy_age"],
                         train_replay_buffer_size=train_replay_buffer_size,
                     )
-                    self.logger.info("done logging metrics")
 
                 self.cleanup_after_step(trajectory, grpo_stats)
 
@@ -2166,26 +2138,23 @@ class TrainingActor(Actor):
 
     async def sync_weights(self, new_sd):
         self.policy_version += 1
-        self.logger.info("syncing weights at {}".format(self.policy_version))
+        self.logger.info("syncing weights w/ PS at {}".format(self.policy_version))
         # TODO - replace w/ rdmabuffer
         if self._is_rank_zero:
             await self.param_server.acquire_write_lock().call()
+            self.logger.info("acquired lock")
             h = self.param_server.receive_from_trainer().call()
-            # self.logger.info("starting sends, keys: {}".format(new_sd.keys()))
             # TODO - we probably need some way to ensure that the keys are in order for any weight transfer...
             for k in sorted(new_sd.keys()):
                 v = new_sd[k]
                 # dst is global rank, can switch to group_dst arg if not 2.5.1
-                # self.logger.info("{} sending {}".format(self.rank, k))
                 torch.distributed.send(v, dst=0)
-            self.logger.info("sends queued, barrier")
             torch.distributed.barrier()
-            self.logger.info("waiting for PS to complete")
             await h
             await self.param_server.release_write_lock().call()
         else:
             torch.distributed.barrier()
-        self.logger.info("done with the weight syncs")
+        self.logger.info("done weight syncs w/ PS")
 
     def _prepare_trajectory(
         self, raw_trajectory: Trajectory
