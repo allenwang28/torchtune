@@ -7,7 +7,7 @@ from functools import partial
 
 from typing import Any, Callable, Dict, Generic, List, Optional, TypeVar
 
-import aiorwlock
+# import aiorwlock
 
 import torch
 import torch.distributed
@@ -199,23 +199,6 @@ def get_device_index(
     )
     entity_world_size = -1
 
-    # if entity == "param_server":
-    #     entity_world_size = param_server_world_size
-    #     offset = 0
-    # elif entity == "rollout":
-    #     entity_world_size = rollout_world_size
-    #     offset = param_server_world_size
-    # elif entity == "postprocessing":
-    #     entity_world_size = postprocessing_world_size
-    #     offset = param_server_world_size + rollout_world_size
-    # elif entity == "training":
-    #     entity_world_size = trainer_world_size
-    #     offset = (
-    #         param_server_world_size + rollout_world_size + postprocessing_world_size
-    #     )
-    # else:
-    #     raise KeyError(f"Unknown entity: {entity}")
-
     if entity == "param_server":
         entity_world_size = param_server_world_size
         offset = 0
@@ -240,7 +223,6 @@ class QueueActor(Actor, Generic[T]):
 
     @endpoint
     async def put(self, item: T) -> None:
-        self.logger.info("putting %s", item)
         await self._q.put(item)
 
     @endpoint
@@ -310,7 +292,6 @@ class ParameterServerActor(Actor):
         self.logger.info("Initializing parameter server...")
         device_index = get_device_index("param_server", 0, 0, self.cfg)
         os.environ["CUDA_VISIBLE_DEVICES"] = str(device_index)
-        torch.cuda.set_device(torch.device("cuda", 0))
         self.logger.info("device index: {}".format(device_index))
         # Note: the parameter server facilitates comms between the trainers
         # and generators. Here, we register the parameter server as
@@ -322,15 +303,13 @@ class ParameterServerActor(Actor):
         os.environ["MASTER_ADDR"] = str(self._trainer_addr)
         os.environ["MASTER_PORT"] = str(self._trainer_port)
         self.device = torch.device("cuda:0")
+        torch.cuda.set_device(self.device)
 
         if not torch.distributed.is_initialized():
             self.logger.info(
                 f"distributed init: rank: {os.environ['RANK']}, world_size: {os.environ['WORLD_SIZE']}, addr: {os.environ['MASTER_ADDR']}, port: {os.environ['MASTER_PORT']}"
             )
-            torch.distributed.init_process_group(
-                backend="nccl", device_id=torch.device("cuda:0")
-            )
-
+            torch.distributed.init_process_group(backend="nccl", rank=0)
         self.logger.info("done with distributed init")
         self.rank = int(os.environ["RANK"])
         self.world_size = int(os.environ["WORLD_SIZE"])
@@ -344,8 +323,14 @@ class ParameterServerActor(Actor):
             self.cfg.training.checkpointer, resume_from_checkpoint=False
         )
         self.state_dict = checkpointer.load_checkpoint()[training.MODEL_KEY]
+
+        for k, v in self.state_dict.items():
+            self.state_dict[k] = v.to(self.device)
         self.logger.info("checkpoint loaded")
-        self.state_dict_lock = aiorwlock.RWLock()
+
+        # aiorwlock may be better here, it just doesn't play well with Monarch for some reason...
+        # self.state_dict_lock = aiorwlock.RWLock()
+        self.state_dict_lock = asyncio.Lock()
         self.version = 0
         self.version_tensor = torch.tensor([0], device="cuda")
 
@@ -358,14 +343,18 @@ class ParameterServerActor(Actor):
 
     @endpoint
     async def acquire_write_lock(self):
-        await self.state_dict_lock.writer_lock.acquire()
+        # TODO - This sleep is a workaround for a Monarch assertion failure I don't quite understand
+        self.logger.info("writer lock acquired")
+        await asyncio.sleep(1.0)
+        await self.state_dict_lock.acquire()
 
     @endpoint
     async def release_write_lock(self):
         self.version += 1
         self.version_tensor += 1
         torch.cuda.synchronize()
-        self.state_dict_lock.writer_lock.release()
+        self.state_dict_lock.release()
+        self.logger.info("writer lock released")
 
     def _get_server_weights(self):
         return self.state_dict
@@ -416,15 +405,15 @@ class ParameterServerActor(Actor):
     @endpoint
     async def sync_weights_with_worker(self, worker_id: int):
         logger = get_logger()
-        # server_weights = self._maybe_map_weights(self._get_server_weights())
+        server_weights = self._maybe_map_weights(self._get_server_weights())
         logger.info("syncing weights with worker {}".format(worker_id))
         server_weights = self.hf_state_dict
         if worker_id not in self.vllm_comm_groups:
             self._init_model_update_group(worker_id)
         logger.info("acquiring reader lock")
-        # TODO - this should be awaited, but for some reason that breaks a monarch assertion?
-        # await self.state_dict_lock.reader_lock.acquire()
-        # self.state_dict_lock.reader_lock.acquire()
+        # TODO - This sleep is a workaround for a Monarch assertion failure I don't quite understand
+        await asyncio.sleep(1)
+        await self.state_dict_lock.acquire()
         logger.info("acquired!")
         for i, k in enumerate(server_weights.keys()):
             self.vllm_comm_groups[worker_id].broadcast(
@@ -436,15 +425,21 @@ class ParameterServerActor(Actor):
         )
         torch.cuda.synchronize()
         self.vllm_weight_versions[worker_id] = self.version
-        # self.state_dict_lock.reader_lock.release()
+        self.state_dict_lock.release()
 
     @endpoint
     async def receive_from_trainer(self):
-        for _, v in self.state_dict.items():
-            torch.distributed.recv(v, src=0)
+        # self.logger.info("receiving from trainer (dict: {})".format(self.state_dict))
+        # self.logger.info("{} receiving from trainer. keys: {}".format(self.rank, self.state_dict.keys()))
+        for k in sorted(self.state_dict.keys()):
+            v = self.state_dict[k]
+            # self.logger.info("{} receiving {}".format(self.rank, k))
+            torch.distributed.recv(v, src=1)
+        self.logger.info("receives queued, barrier")
+        torch.distributed.barrier()
         # map to the huggingface state dict in place
-        torch.cuda.synchronize()
         self.hf_state_dict = self._maybe_map_weights(self.state_dict)
+        self.logger.info("done updating weights")
 
     @endpoint
     async def get_model_metadata(self) -> dict[str, tuple[torch.Size, torch.Size]]:
@@ -613,6 +608,7 @@ class SyncLLMCollector(SyncDataCollector):
         device_index = get_device_index("rollout", local_rank, global_rank, cfg)
         self.logger.info("device index: {}".format(device_index))
         device = torch.device("cuda:{}".format(device_index))
+        torch.cuda.set_device(device)
         os.environ["CUDA_VISIBLE_DEVICES"] = str(device_index)
         # torch.cuda.set_device(device)
 
@@ -1019,10 +1015,9 @@ class RolloutActor(Actor):
         num_steps = 10
         for i in range(num_steps):
             # TODO - check for update
-            # if i > 0 and i % self.cfg.inference.steps_before_weight_sync == 0:
-            if i % self.cfg.inference.steps_before_weight_sync == 0:
+            if i > 0 and i % self.cfg.inference.steps_before_weight_sync == 0:
+                # if i % self.cfg.inference.steps_before_weight_sync == 0:
                 self.logger.info("Updating weights...")
-                # self.collector.update_policy_weights_()
                 # TODO - workaround needed, since actor calls must be async
                 await self.collector.weight_update_receiver.update_weights2()
 
@@ -1071,6 +1066,7 @@ class PostProcessingActor(Actor):
         self.logger.info("device_index: {}".format(device_index))
         os.environ["CUDA_VISIBLE_DEVICES"] = str(device_index)
         self._device = torch.device("cuda:{}".format(device_index))
+        torch.cuda.set_device(self._device)
         self._dtype = training.get_dtype("bf16", device=self._device)
         self._ref_model = self._build_reference_model()
         self._temperature = self.cfg.inference.temperature
@@ -1407,14 +1403,18 @@ class TrainingActor(Actor):
             "cuda", offload_ops_to_cpu=self.fsdp_cpu_offload
         )
 
-        torch.cuda.set_device(device_index)
+        self._device = torch.device("cuda:{}".format(device_index))
+        torch.cuda.set_device(self._device)
 
         self.logger.info(
-            f"distributed init: rank: {os.environ['RANK']}, world_size: {os.environ['WORLD_SIZE']}, addr: {os.environ['MASTER_ADDR']}, port: {os.environ['MASTER_PORT']}, visible devices: {os.environ['CUDA_VISIBLE_DEVICES']}"
+            f"distributed init: rank: {os.environ['RANK']}, world_size: {os.environ['WORLD_SIZE']}, addr: {os.environ['MASTER_ADDR']}, port: {os.environ['MASTER_PORT']}, visible devices: {os.environ['CUDA_VISIBLE_DEVICES']}, backend: {self.distributed_backend}"
         )
         if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(backend=self.distributed_backend)
+            torch.distributed.init_process_group(
+                backend=self.distributed_backend, rank=self.local_rank + 1
+            )
 
+        self.rank = int(os.environ["RANK"])
         self.world_size = int(os.environ["WORLD_SIZE"])
         ranks = list(range(1, self.world_size))
         self.logger.info("ranks: %s", ranks)
@@ -1446,7 +1446,6 @@ class TrainingActor(Actor):
                 "enable_activation_offloading should only be True when enable_activation_checkpointing is True"
             )
 
-        self._device = torch.device("cuda:{}".format(device_index))
         self._dtype = training.get_dtype("bf16", device=self._device)
         # Recipe state
         # self.seed = training.set_seed(seed=self.cfg.training.seed)
@@ -2007,12 +2006,10 @@ class TrainingActor(Actor):
             self.logger = get_logger()
             self.logger.info("Starting GRPO training loop...")
             training.cleanup_before_training()
-            self.logger.info("cleaned up")
             self._optimizer.zero_grad()
             self._profiler.start()
 
             while self._steps_run < self._total_dialog_turns:
-                self.logger.info("mem profile")
                 # Memory profiling start
                 if (
                     self._is_rank_zero
@@ -2028,14 +2025,13 @@ class TrainingActor(Actor):
                 time_waiting_buffer_start = time.perf_counter()
                 train_replay_buffer_size = None
                 if self._is_rank_zero:
-                    self.logger.info("fetching from buffer")
                     train_replay_buffer_size = await self.replay_buffer.len().call()
 
                 num_waits = 0
                 while await self.replay_buffer.is_empty().call():
                     if self._is_rank_zero and num_waits % 10 == 0:
                         self.logger.info("waiting for replay buffer...")
-                    await asyncio.sleep(1.0)
+                    await asyncio.sleep(1)
                     num_waits += 1
 
                 # TODO - batching?
@@ -2174,11 +2170,22 @@ class TrainingActor(Actor):
         # TODO - replace w/ rdmabuffer
         if self._is_rank_zero:
             await self.param_server.acquire_write_lock().call()
-            await self.param_server.receive_from_trainer().call()
-            for i, (k, v) in enumerate(new_sd.items()):
+            h = self.param_server.receive_from_trainer().call()
+            # self.logger.info("starting sends, keys: {}".format(new_sd.keys()))
+            # TODO - we probably need some way to ensure that the keys are in order for any weight transfer...
+            for k in sorted(new_sd.keys()):
+                v = new_sd[k]
                 # dst is global rank, can switch to group_dst arg if not 2.5.1
-                torch.distributed.send(v, dst=self.world_size - 1)
+                # self.logger.info("{} sending {}".format(self.rank, k))
+                torch.distributed.send(v, dst=0)
+            self.logger.info("sends queued, barrier")
+            torch.distributed.barrier()
+            self.logger.info("waiting for PS to complete")
+            await h
             await self.param_server.release_write_lock().call()
+        else:
+            torch.distributed.barrier()
+        self.logger.info("done with the weight syncs")
 
     def _prepare_trajectory(
         self, raw_trajectory: Trajectory
@@ -2275,6 +2282,17 @@ class MonarchGRPORecipe(OrchestrationRecipeInterface):
         self.num_postprocessing_workers = cfg.orchestration.num_postprocessing_workers
         self.num_training_workers = cfg.orchestration.num_training_workers
 
+        enable_nccl_debug = False
+        if enable_nccl_debug:
+            env = {
+                "NCCL_DEBUG": "INFO",
+                "CUDA_LAUNCH_BLOCKING": "1",
+                "NCCL_DEBUG_SUBSYS": "ALL",
+                "NCCL_ASYNC_ERROR_HANDLING": "1",
+            }
+        else:
+            env = {}
+
         # We want to create distributed groups for:
         # 1) all rollout workers and
         # 2) trainers
@@ -2293,12 +2311,7 @@ class MonarchGRPORecipe(OrchestrationRecipeInterface):
         # TODO - consider splitting these into their own procs
         self.singleton_proc_mesh = await proc_mesh(
             gpus=1,
-            env={
-                "NCCL_DEBUG": "INFO",
-                "CUDA_LAUNCH_BLOCKING": "1",
-                "NCCL_DEBUG_SUBSYS": "ALL",
-                "NCCL_P2P_DISABLE": "1",
-            },
+            env=env,
         )
         self.logger.info("spawning metric actor")
         self.metric_actor = await self.singleton_proc_mesh.spawn(
@@ -2316,12 +2329,7 @@ class MonarchGRPORecipe(OrchestrationRecipeInterface):
 
         self.param_server_proc_mesh = await proc_mesh(
             gpus=1,
-            env={
-                "NCCL_DEBUG": "INFO",
-                "CUDA_LAUNCH_BLOCKING": "1",
-                "NCCL_DEBUG_SUBSYS": "ALL",
-                "NCCL_P2P_DISABLE": "1",
-            },
+            env=env,
         )
         self.param_server_actor = await self.param_server_proc_mesh.spawn(
             "param_server",
@@ -2345,12 +2353,7 @@ class MonarchGRPORecipe(OrchestrationRecipeInterface):
             self.rollout_proc_meshes.append(
                 await proc_mesh(
                     gpus=inference_tp,
-                    env={
-                        "NCCL_DEBUG": "INFO",
-                        "CUDA_LAUNCH_BLOCKING": "1",
-                        "NCCL_DEBUG_SUBSYS": "ALL",
-                        "NCCL_P2P_DISABLE": "1",
-                    },
+                    env=env,
                 )
             )
             self.rollout_actor_meshes.append(
@@ -2379,12 +2382,7 @@ class MonarchGRPORecipe(OrchestrationRecipeInterface):
             self.postprocess_proc_meshes.append(
                 await proc_mesh(
                     gpus=postprocess_tp,
-                    env={
-                        "NCCL_DEBUG": "INFO",
-                        "CUDA_LAUNCH_BLOCKING": "1",
-                        "NCCL_DEBUG_SUBSYS": "ALL",
-                        "NCCL_P2P_DISABLE": "1",
-                    },
+                    env=env,
                 )
             )
             self.postprocess_actor_meshes.append(
@@ -2404,12 +2402,7 @@ class MonarchGRPORecipe(OrchestrationRecipeInterface):
         self.logger.info(f"[training] Creating mesh of size {training_shards}...")
         self.training_mesh = await proc_mesh(
             gpus=training_shards,
-            env={
-                "NCCL_DEBUG": "INFO",
-                "CUDA_LAUNCH_BLOCKING": "1",
-                "NCCL_DEBUG_SUBSYS": "ALL",
-                "NCCL_P2P_DISABLE": "1",
-            },
+            env=env,
         )
         self.training_actor = await self.training_mesh.spawn(
             "training",
