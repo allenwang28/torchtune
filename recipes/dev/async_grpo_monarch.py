@@ -347,7 +347,7 @@ class ParameterServerActor(Actor):
         return self.version
 
     @endpoint
-    async def skip_update(self, worker_id) -> bool:
+    async def skip_update(self, worker_id: int) -> bool:
         if self.version == 0:
             return True
         if worker_id not in self.vllm_weight_versions:
@@ -391,9 +391,10 @@ class ParameterServerActor(Actor):
         if worker_id not in self.vllm_comm_groups:
             self._init_model_update_group(worker_id)
         await self.state_dict_lock.acquire()
-        logger.info("acquired dict!")
+        logger.info("acquired lock!")
+        logger.info("sorted keys: {}".format(sorted(server_weights.keys())))
         for i, k in enumerate(sorted(server_weights.keys())):
-            self.logger.info("broadcast {}".format(k))
+            # self.logger.info("broadcast {}".format(k))
             self.vllm_comm_groups[worker_id].broadcast(
                 server_weights[k], src=0, stream=torch.cuda.current_stream()
             )
@@ -408,12 +409,15 @@ class ParameterServerActor(Actor):
     @endpoint
     async def receive_from_trainer(self):
         self.logger.info("receiving weights from trainer")
+        await self.state_dict_lock.acquire()
+        self.logger.info("acquired lock")
         for k in sorted(self.state_dict.keys()):
             v = self.state_dict[k]
             torch.distributed.recv(v, src=1)
         torch.distributed.barrier()
         self.hf_state_dict = self._maybe_map_weights(self.state_dict)
         self.logger.info("done receiving weights from trainer")
+        self.state_dict_lock.release()
 
     @endpoint
     async def get_model_metadata(self) -> dict[str, tuple[torch.Size, torch.Size]]:
@@ -453,35 +457,43 @@ class VLLMHFWeightUpdateReceiver(WeightUpdateReceiverBase):
         return None
 
     async def update_weights2(self):
+        logger = get_logger()
+        logger.info("updating weights")
+
         if not self.model_metadata:
             self.model_metadata = await self.param_server.get_model_metadata().call()
-        should_update = await self.param_server.skip_update(self.worker_idx).call()
-        if should_update:
-            fut = self.param_server.sync_weights_with_worker(self.worker_idx).call()
-            inference_server = self.collector.inference_server
-            if self.initialized_group is None:
-                weight_sync_world_size = (
-                    inference_server.llm_engine.parallel_config.tensor_parallel_size + 1
-                )
-                inference_server.collective_rpc(
-                    "init_weight_update_group",
-                    args=(
-                        self.master_address,
-                        self.master_port,
-                        1,
-                        weight_sync_world_size,
-                    ),
-                )
-                self.initialized_group = True
+        # should_update = await self.param_server.skip_update(self.worker_idx).call()
+        # if should_update:
+        fut = self.param_server.sync_weights_with_worker(self.worker_idx).call()
+        inference_server = self.collector.inference_server
+        if self.initialized_group is None:
+            weight_sync_world_size = (
+                inference_server.llm_engine.parallel_config.tensor_parallel_size + 1
+            )
+            inference_server.collective_rpc(
+                "init_weight_update_group",
+                args=(
+                    self.master_address,
+                    self.master_port,
+                    1,
+                    weight_sync_world_size,
+                ),
+            )
+            self.initialized_group = True
 
-            logger = get_logger()
-            for k in sorted(self.model_metadata.keys()):
-                dtype, shape = self.model_metadata[k]
-                logger.info("broadcast: {}".format(k))
-                inference_server.collective_rpc("update_weight", args=(k, dtype, shape))
+        logger.info(
+            "beginning broadcasts, sorted keys are: {}".format(
+                sorted(self.model_metadata.keys())
+            )
+        )
+        for k in sorted(self.model_metadata.keys()):
+            dtype, shape = self.model_metadata[k]
+            # logger.info("broadcast: {}".format(k))
+            inference_server.collective_rpc("update_weight", args=(k, dtype, shape))
 
-            await fut
-            inference_server.collective_rpc("update_policy_version")
+        await fut
+        inference_server.collective_rpc("update_policy_version")
+        logger.info("done with update")
 
 
 class VLLMWorkerWrapper(Worker):
@@ -535,11 +547,14 @@ class VLLMWorkerWrapper(Worker):
         self.model_runner.model.load_weights(weights=[(name, weight)])
         del weight
 
+    # TODO - fix this
     def update_policy_version(self):
         self._model_update_group.broadcast(
             self.version, src=0, stream=torch.cuda.current_stream()
         )
         self.policy_version = self.version
+        logger = get_logger()
+        logger.info("new version got: {}".format(self.version))
         torch.cuda.synchronize()
 
 
@@ -997,7 +1012,11 @@ class RolloutActor(Actor):
                 torch.tensor([0]),
             ).item()
             if ps_version != current_policy:
-                self.logger.info("Updating weights...")
+                self.logger.info(
+                    "Updating weights from {} to {}...".format(
+                        current_policy, ps_version
+                    )
+                )
                 await self.collector.weight_update_receiver.update_weights2()
 
             self.logger.info(f"starting rollout for step {i}")
@@ -2141,8 +2160,8 @@ class TrainingActor(Actor):
         self.logger.info("syncing weights w/ PS at {}".format(self.policy_version))
         # TODO - replace w/ rdmabuffer
         if self._is_rank_zero:
-            await self.param_server.acquire_write_lock().call()
-            self.logger.info("acquired lock")
+            # await self.param_server.acquire_write_lock().call()
+            # self.logger.info("acquired lock")
             h = self.param_server.receive_from_trainer().call()
             # TODO - we probably need some way to ensure that the keys are in order for any weight transfer...
             for k in sorted(new_sd.keys()):
@@ -2151,7 +2170,7 @@ class TrainingActor(Actor):
                 torch.distributed.send(v, dst=0)
             torch.distributed.barrier()
             await h
-            await self.param_server.release_write_lock().call()
+            # await self.param_server.release_write_lock().call()
         else:
             torch.distributed.barrier()
         self.logger.info("done weight syncs w/ PS")
