@@ -391,16 +391,10 @@ class ParameterServerActor(Actor):
         if worker_id not in self.vllm_comm_groups:
             self._init_model_update_group(worker_id)
         await self.state_dict_lock.acquire()
-        logger.info("acquired lock!")
-        logger.info("sorted keys: {}".format(sorted(server_weights.keys())))
         for i, k in enumerate(sorted(server_weights.keys())):
-            # self.logger.info("broadcast {}".format(k))
             self.vllm_comm_groups[worker_id].broadcast(
                 server_weights[k], src=0, stream=torch.cuda.current_stream()
             )
-        # self.vllm_comm_groups[worker_id].broadcast(
-        #     self.version_tensor, src=0, stream=torch.cuda.current_stream()
-        # )
         torch.cuda.synchronize()
         self.vllm_weight_versions[worker_id] = self.version
         self.state_dict_lock.release()
@@ -411,7 +405,6 @@ class ParameterServerActor(Actor):
     async def receive_from_trainer(self):
         self.logger.info("receiving weights from trainer")
         await self.state_dict_lock.acquire()
-        self.logger.info("acquired lock")
         for k in sorted(self.state_dict.keys()):
             v = self.state_dict[k]
             torch.distributed.recv(v, src=1)
@@ -484,11 +477,11 @@ class VLLMHFWeightUpdateReceiver(WeightUpdateReceiverBase):
             )
             self.initialized_group = True
 
-        logger.info(
-            "beginning broadcasts, sorted keys are: {}".format(
-                sorted(self.model_metadata.keys())
-            )
-        )
+        # logger.info(
+        #     "beginning broadcasts, sorted keys are: {}".format(
+        #         sorted(self.model_metadata.keys())
+        #     )
+        # )
         for k in sorted(self.model_metadata.keys()):
             dtype, shape = self.model_metadata[k]
             # logger.info("broadcast: {}".format(k))
