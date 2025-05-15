@@ -383,7 +383,7 @@ class ParameterServerActor(Actor):
         self.vllm_comm_groups[worker_id] = model_update_group
 
     @endpoint
-    async def sync_weights_with_worker(self, worker_id: int):
+    async def sync_weights_with_worker(self, worker_id: int) -> int:
         logger = get_logger()
         server_weights = self._maybe_map_weights(self._get_server_weights())
         logger.info("syncing weights with worker {}".format(worker_id))
@@ -398,13 +398,14 @@ class ParameterServerActor(Actor):
             self.vllm_comm_groups[worker_id].broadcast(
                 server_weights[k], src=0, stream=torch.cuda.current_stream()
             )
-        self.vllm_comm_groups[worker_id].broadcast(
-            self.version_tensor, src=0, stream=torch.cuda.current_stream()
-        )
+        # self.vllm_comm_groups[worker_id].broadcast(
+        #     self.version_tensor, src=0, stream=torch.cuda.current_stream()
+        # )
         torch.cuda.synchronize()
         self.vllm_weight_versions[worker_id] = self.version
         self.state_dict_lock.release()
-        self.logger.info("done syncing weights with worker {}".format(worker_id))
+        self.logger.info("done syncing weights with worker {}. new version {}".format(worker_id, self.version))
+        return self.version
 
     @endpoint
     async def receive_from_trainer(self):
@@ -417,6 +418,8 @@ class ParameterServerActor(Actor):
         torch.distributed.barrier()
         self.hf_state_dict = self._maybe_map_weights(self.state_dict)
         self.logger.info("done receiving weights from trainer")
+        self.version += 1
+        self.version_tensor += 1
         self.state_dict_lock.release()
 
     @endpoint
@@ -491,9 +494,10 @@ class VLLMHFWeightUpdateReceiver(WeightUpdateReceiverBase):
             # logger.info("broadcast: {}".format(k))
             inference_server.collective_rpc("update_weight", args=(k, dtype, shape))
 
-        await fut
-        inference_server.collective_rpc("update_policy_version")
-        logger.info("done with update")
+        logger.info("worker {} done with broadcasts, waiting for version".format(self.worker_idx))
+        version = await fut
+        logger.info("worker {} done with update".format(self.worker_idx))
+        return version
 
 
 class VLLMWorkerWrapper(Worker):
@@ -546,16 +550,6 @@ class VLLMWorkerWrapper(Worker):
         )
         self.model_runner.model.load_weights(weights=[(name, weight)])
         del weight
-
-    # TODO - fix this
-    def update_policy_version(self):
-        self._model_update_group.broadcast(
-            self.version, src=0, stream=torch.cuda.current_stream()
-        )
-        self.policy_version = self.version
-        logger = get_logger()
-        logger.info("new version got: {}".format(self.version))
-        torch.cuda.synchronize()
 
 
 class SyncLLMCollector(SyncDataCollector):
@@ -831,7 +825,7 @@ class SyncLLMCollector(SyncDataCollector):
         results_td: TensorDict = lazy_stack(trajectories, -1)
         return results_td
 
-    def rollout_step(self) -> tuple[Trajectory, dict[str, float]]:
+    def rollout_step(self, policy_version: int) -> tuple[Trajectory, dict[str, float]]:
         """Executes a rollout and processes the results into a standardized format.
 
         This method extends the base rollout functionality by:
@@ -871,11 +865,11 @@ class SyncLLMCollector(SyncDataCollector):
             ]
         )
 
-        policy_version = getattr(
-            self.inference_server.llm_engine.model_executor.driver_worker.worker,
-            "policy_version",
-            torch.tensor([0]),
-        ).item()
+        # policy_version = getattr(
+        #     self.inference_server.llm_engine.model_executor.driver_worker.worker,
+        #     "policy_version",
+        #     torch.tensor([0]),
+        # ).item()
         total_generated_tokens = seq_lens.sum().item()
 
         trajectory = Trajectory(
@@ -985,7 +979,7 @@ class RolloutActor(Actor):
             master_address=self._weight_update_receiver_address,
             master_port=self._weight_update_receiver_port,
             param_server=self._param_server,
-            worker_idx=self.local_rank,
+            worker_idx=self.global_rank,
         )
         self.collector = SyncLLMCollector(
             cfg=self.cfg,
@@ -1004,23 +998,21 @@ class RolloutActor(Actor):
         self.logger.info("Running rollout actor...")
 
         i = 0
+        policy_version = 0
         while True:
             ps_version = await self._param_server.current_policy_version().call()
-            current_policy = getattr(
-                self.collector.inference_server.llm_engine.model_executor.driver_worker.worker,
-                "policy_version",
-                torch.tensor([0]),
-            ).item()
-            if ps_version != current_policy:
+            if ps_version != policy_version:
                 self.logger.info(
                     "Updating weights from {} to {}...".format(
-                        current_policy, ps_version
+                        policy_version, ps_version
                     )
                 )
-                await self.collector.weight_update_receiver.update_weights2()
+                policy_version = (
+                    await self.collector.weight_update_receiver.update_weights2()
+                )
 
-            self.logger.info(f"starting rollout for step {i}")
-            trajectories, runtime_metrics = self.collector.rollout_step()
+            self.logger.info(f"starting rollout for step {i} (policy {policy_version})")
+            trajectories, runtime_metrics = self.collector.rollout_step(policy_version)
             await self._metric_actor.log_dict(runtime_metrics, step=i).call()
             # TODO - the first rollout step triggers vLLM initialization which should not be necessary.
             # We should be able to avoid this, but needs further investigation.
