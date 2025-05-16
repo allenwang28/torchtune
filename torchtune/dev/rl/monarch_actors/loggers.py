@@ -5,10 +5,10 @@
 # LICENSE file in the root directory of this source tree.
 import inspect
 import logging
+import time
 
 from monarch.service import Actor, current_rank, current_size, endpoint
 from torchtune import config
-import time
 
 
 class MetricsLoggerActor(Actor):
@@ -90,10 +90,17 @@ class MonarchLogger(logging.Logger):
 
 
 def get_logger() -> logging.Logger:
+    """Returns the Monarch-integrated logger."""
     logging.setLoggerClass(MonarchLogger)
     logger = logging.getLogger(__name__)
     if logger.hasHandlers():
         logger.handlers.clear()
-        logger.addHandler(logging.StreamHandler())
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter(
+        "%(message)s"
+    )  # Simplified formatter since MonarchLogger adds its own formatting
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.propagate = False
     logger.setLevel(logging.INFO)
     return logger

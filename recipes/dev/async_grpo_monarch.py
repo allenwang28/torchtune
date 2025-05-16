@@ -1,6 +1,12 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.import asyncio
 import asyncio
 import os
 import random
+import socket
 import time
 from dataclasses import dataclass
 from functools import partial
@@ -49,8 +55,8 @@ T = TypeVar("T")
 
 
 # ========= Common functions =========
-def get_ip():
-    import socket
+def get_ip() -> str:
+    """Returns an IP address."""
 
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -65,15 +71,10 @@ def get_ip():
 
 
 def set_seed(seed: int):
+    """Sets a seed for torch, numpy and random."""
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
-
-
-# ========= Constants =========
-_TOK_RESPONSE_KEY = "tokens_response"
-_TEXT_RESPONSE_KEY = "text_response"
-_LOG_PROBS_KEY = "log_probs"
 
 
 # ========= Generic data structures + functionality =========
@@ -136,8 +137,9 @@ def get_device_index(
 
 
 class QueueActor(Actor, Generic[T]):
+    """A simple async queue, implemented as a Monarch actor."""
+
     def __init__(self):
-        self.logger = get_logger()
         self._q: asyncio.Queue[T] = asyncio.Queue()
 
     @endpoint
@@ -158,6 +160,8 @@ class QueueActor(Actor, Generic[T]):
 
 
 class ReplayBufferActor(Actor):
+    """A replay buffer, implemented as a Monarch actor."""
+
     def __init__(self, cfg: DictConfig):
         self.rb = ReplayBuffer(
             storage=partial(
@@ -165,7 +169,6 @@ class ReplayBufferActor(Actor):
             ),
             batch_size=cfg.training.batch_size,
         )
-        self.logger = get_logger()
 
     @endpoint
     async def extend(self, sample: Trajectory):
@@ -185,44 +188,70 @@ class ReplayBufferActor(Actor):
 
 
 # ========= Cabernet actors + data structures=========
-
-# ========= Generic actor definitions and their verbs =========
-
-
-class Generator(Actor):
-    pass
-
-
 class ParameterStore(Actor):
+    """Base class for parameter storage and synchronization between trainers and generators.
+
+    This abstract class defines the interface for parameter stores that manage model weights
+    in distributed training scenarios. Parameter stores act as central repositories that
+    facilitate weight sharing between trainers (which update weights) and generators
+    (which use weights for inference).
+
+    The parameter store maintains version tracking to ensure consistency across the
+    distributed system and provides synchronization mechanisms for weight updates.
+
+    Implementations should handle efficient weight transfer, format conversions if needed,
+    and proper synchronization to prevent race conditions during updates.
+    """
+
     @endpoint
-    async def get(self, generator: Generator | int) -> int:
+    async def get(self, generator: Actor | int) -> int:
         """Transmits weights from the parameter store to the generator.
 
+        This method sends the current model weights to the specified generator,
+        typically using an efficient communication protocol like NCCL.
+
+        Args:
+            generator (Generator): The generator (or its index) requesting the weights
+
         Returns:
-            The policy version
+            int: The current policy version number
         """
         raise NotImplementedError
 
     @endpoint
     async def put(self, version: int):
-        """Transmits weights from the trainer to the parameter store."""
+        """Transmits weights from the trainer to the parameter store.
+
+        This method receives updated weights from a trainer and updates
+        the internal state of the parameter store.
+
+        Args:
+            version (int): The new version number for these weights
+        """
         raise NotImplementedError
 
     @endpoint
     async def get_version(self) -> int:
-        """Returns the current version."""
+        """Returns the current version of the model weights.
+
+        Returns:
+            int: The current policy version number
+        """
         raise NotImplementedError
 
     @endpoint
     async def get_generator_model_metadata(
         self,
     ) -> dict[str, tuple[torch.dtype, torch.Size]]:
-        """Returns the model's state dict metadata."""
+        """Returns metadata about the model's state dictionary.
+
+        This method provides information about tensor shapes and dtypes,
+        which helps generators prepare memory for receiving weights.
+
+        Returns:
+            dict: Mapping of parameter names to tuples of (dtype, shape)
+        """
         raise NotImplementedError
-
-
-class Trainer(Actor):
-    pass
 
 
 @dataclass
@@ -231,8 +260,8 @@ class ActorSet:
 
     param_store: ParameterStore
     metric_logger: MetricsLoggerActor
-    trainer: Trainer
-    generators: list[Generator]
+    trainer: Actor
+    generators: list[Actor]
 
 
 @dataclass
@@ -276,7 +305,7 @@ class HFVLLMParameterServer(ParameterStore):
         actor_set: ActorSet,
         dist_info_map: dict[Actor, DistributedInfo],
     ):
-        """Initialize the parameter server and establish connections with trainers and generators.
+        """Initializes the parameter server and establish connections with trainers and generators.
 
         This method:
         1. Sets up the device for the parameter server
@@ -290,6 +319,8 @@ class HFVLLMParameterServer(ParameterStore):
             dist_info_map (dict): Mapping of actors to their distributed communication info
         """
         self.device_index = get_device_index("param_store", 0, 0, self.cfg)
+        # Note - the logger isn't being pickled through Monarch which is why we're
+        # calling it many times.
         logger = get_logger()
         logger.info("assigned device index: %d", self.device_index)
         self.device = torch.device("cuda:{}".format(self.device_index))
@@ -334,7 +365,7 @@ class HFVLLMParameterServer(ParameterStore):
     async def get_generator_model_metadata(
         self,
     ) -> dict[str, tuple[torch.dtype, torch.Size]]:
-        """Get metadata about the model's tensors to prepare for weight synchronization.
+        """Gets metadata about the model's tensors to prepare for weight synchronization.
 
         Returns:
             dict: Mapping of parameter names to tuples of (dtype, shape)
@@ -342,7 +373,7 @@ class HFVLLMParameterServer(ParameterStore):
         return self._model_metadata
 
     def _prepare_hf_weights(self) -> dict[str, torch.Tensor]:
-        """Convert TorchTune model weights to HuggingFace format.
+        """Converts TorchTune model weights to HuggingFace format.
 
         This method transforms the internal state dictionary to the format expected
         by HuggingFace models used in vLLM, handling architecture-specific conversions.
@@ -358,7 +389,7 @@ class HFVLLMParameterServer(ParameterStore):
         return sd
 
     def _connect_to_trainer(self, dist_info: DistributedInfo):
-        """Establish a distributed connection with the trainer.
+        """Establishes a distributed connection with the trainer.
 
         Sets up the NCCL communication channel with the trainer for weight updates.
 
@@ -380,7 +411,7 @@ class HFVLLMParameterServer(ParameterStore):
         logger.info("Done connecting to trainer")
 
     def _connect_to_generator(self, generator: Actor, dist_info: DistributedInfo):
-        """Establish a distributed connection with a generator.
+        """Establishes a distributed connection with a generator.
 
         Sets up the NCCL communication channel with a generator for weight distribution.
 
@@ -406,8 +437,8 @@ class HFVLLMParameterServer(ParameterStore):
         logger.info("Done connecting to generator {}".format(generator))
 
     @endpoint
-    async def get(self, generator: Generator | int) -> int:
-        """Send model weights to a generator.
+    async def get(self, generator: Actor | int) -> int:
+        """Sends model weights to a generator.
 
         Broadcasts the current HuggingFace-formatted weights to the specified generator
         using the established communication channel.
@@ -435,7 +466,7 @@ class HFVLLMParameterServer(ParameterStore):
 
     @endpoint
     async def put(self, version: int):
-        """Receive updated weights from the trainer.
+        """Receives updated weights from the trainer.
 
         Updates the internal state dictionary with weights from the trainer and
         converts them to HuggingFace format for future distribution to generators.
@@ -458,7 +489,7 @@ class HFVLLMParameterServer(ParameterStore):
 
     @endpoint
     async def get_version(self) -> int:
-        """Get the current version of the model weights.
+        """Gets the current version of the model weights.
 
         Returns:
             int: The current version number
@@ -469,18 +500,17 @@ class HFVLLMParameterServer(ParameterStore):
         return "HFVLLMParameterServer"
 
 
+# TODO - consider consolidating Rollout, without SyncDataCollector
 class VLLMHFWeightUpdateReceiver(WeightUpdateReceiverBase):
     """A weight update receiver for vLLM / HuggingFace."""
 
     def __init__(
         self,
-        master_address: str,
-        master_port: int,
+        dist_info: DistributedInfo,
         param_store: ParameterStore,
-        worker_idx,
+        worker_idx: int,
     ):
-        self.master_address = master_address
-        self.master_port = master_port
+        self._dist_info = dist_info
         self.param_store = param_store
         self.worker_idx = worker_idx
         self.model_metadata = None
@@ -501,21 +531,17 @@ class VLLMHFWeightUpdateReceiver(WeightUpdateReceiverBase):
         logger = get_logger()
         logger.info("Connecting with parameter store...")
         logger.info("Got model metadata")
-        weight_sync_world_size = (
-            self.collector.inference_server.llm_engine.parallel_config.tensor_parallel_size
-            + 1
-        )
         self.collector.inference_server.collective_rpc(
             "init_weight_update_group",
             args=(
-                self.master_address,
-                self.master_port,
+                self._dist_info.address,
+                self._dist_info.port,
                 1,
-                weight_sync_world_size,
+                self._dist_info.world_size,
             ),
         )
 
-    async def update_weights2(self):
+    async def update_weights(self):
         logger = get_logger()
         logger.info("updating weights")
         if not self.model_metadata:
@@ -570,7 +596,6 @@ class VLLMWorkerWrapper(Worker):
         self.version = torch.tensor([0], device="cuda")
 
     def update_weight(self, name, dtype, shape):
-        logger = get_logger()
         weight = torch.empty(shape, dtype=dtype, device="cuda")
         # src=0 because fsdp worker 0 has been assigned as "0" in this process group
         self._model_update_group.broadcast(
@@ -612,15 +637,15 @@ class SyncLLMCollector(SyncDataCollector):
         self.reset_at_each_iter = reset_at_each_iter
         self.dialog_turns_per_batch = dialog_turns_per_batch
         self.total_dialog_turns = total_dialog_turns
-        self.logger = get_logger()
         self.local_rank = local_rank
         self.global_rank = global_rank
         device_index = get_device_index("rollout", local_rank, global_rank, cfg)
-        self.logger.info("device index: {}".format(device_index))
+
+        logger = get_logger()
+        logger.info("device index: {}".format(device_index))
         device = torch.device("cuda:{}".format(device_index))
         torch.cuda.set_device(device)
         os.environ["CUDA_VISIBLE_DEVICES"] = str(device_index)
-        # torch.cuda.set_device(device)
 
         from torchtune import config
 
@@ -691,6 +716,10 @@ class SyncLLMCollector(SyncDataCollector):
                 - text_response: generated text strings
                 - log_probs: log probabilities of generated tokens
         """
+        _TOK_RESPONSE_KEY = "tokens_response"
+        _TEXT_RESPONSE_KEY = "text_response"
+        _LOG_PROBS_KEY = "log_probs"
+
         from vllm import SamplingParams
 
         with self.device:
@@ -892,12 +921,6 @@ class SyncLLMCollector(SyncDataCollector):
                 for i in range(batch_size)
             ]
         )
-
-        # policy_version = getattr(
-        #     self.inference_server.llm_engine.model_executor.driver_worker.worker,
-        #     "policy_version",
-        #     torch.tensor([0]),
-        # ).item()
         total_generated_tokens = seq_lens.sum().item()
 
         trajectory = Trajectory(
@@ -957,21 +980,18 @@ class RolloutActor(Actor):
         metric_actor: MetricsLoggerActor,
         rollout_queue_actor: QueueActor,
         param_store: ParameterStore,
-        address: str,
-        port: int,
+        dist_info: DistributedInfo,
         reset_at_each_iter: bool = False,
         dialog_turns_per_batch: int = 1,
     ):
         self.cfg = cfg
-        self.logger = get_logger()
         self.reset_at_each_iter = reset_at_each_iter
         self._shuttle = None
         self.dialog_turns_per_batch = dialog_turns_per_batch
         self._metric_actor = metric_actor
         self._rollout_queue_actor = rollout_queue_actor
         self._param_store = param_store
-        self._weight_update_receiver_address = address
-        self._weight_update_receiver_port = port
+        self._dist_info = dist_info
 
         # local_rank = parallelism rank within a distributed group
         self.local_rank = current_rank()["gpus"]
@@ -989,24 +1009,12 @@ class RolloutActor(Actor):
           and errors can be propagated.
 
         """
-        # Set CUDA visible devices
-        # TODO - some checking here?
-        vllm_world_size = self.cfg.inference.tensor_parallel_dim
-        gpu_indices = list(
-            range(
-                self.global_rank * vllm_world_size,
-                (self.global_rank + 1) * vllm_world_size,
-            )
-        )
-        # The following env variables help guarantee GPU isolation
-        gpu_indices = ",".join(str(idx) for idx in gpu_indices)
+        logger = get_logger()
+        logger.info("Initializing rollout actor...")
         os.environ["LOCAL_RANK"] = str(self.local_rank)
         set_seed(self.cfg.seed)
-        # os.environ["CUDA_VISIBLE_DEVICES"] = gpu_indices
-
         weight_update_receiver = VLLMHFWeightUpdateReceiver(
-            master_address=self._weight_update_receiver_address,
-            master_port=self._weight_update_receiver_port,
+            dist_info=self._dist_info,
             param_store=self._param_store,
             worker_idx=self.global_rank,
         )
@@ -1020,29 +1028,29 @@ class RolloutActor(Actor):
         )
 
         await self.collector.weight_update_receiver.connect_with_parameter_store()
-        self.logger.info("done with init!")
+        logger.info("Done with init!")
 
     @endpoint
     async def run(self):
-        # hack to reset stream logs (vLLM hijacks it at some point)
-        self.logger = get_logger()
-        self.logger.info("Running rollout actor...")
+        """Runs the rollout loop."""
+        logger = get_logger()
+        logger.info("Running rollout actor...")
 
         i = 0
         policy_version = 0
         while True:
             ps_version = await self._param_store.get_version().call()
             if ps_version != policy_version:
-                self.logger.info(
+                logger.info(
                     "Updating weights from {} to {}...".format(
                         policy_version, ps_version
                     )
                 )
                 policy_version = (
-                    await self.collector.weight_update_receiver.update_weights2()
+                    await self.collector.weight_update_receiver.update_weights()
                 )
 
-            self.logger.info(f"starting rollout for step {i} (policy {policy_version})")
+            logger.info(f"starting rollout for step {i} (policy {policy_version})")
             trajectories, runtime_metrics = self.collector.rollout_step(policy_version)
             await self._metric_actor.log_dict(runtime_metrics, step=i).call()
             # TODO - the first rollout step triggers vLLM initialization which should not be necessary.
@@ -1055,8 +1063,10 @@ class RolloutActor(Actor):
         return f"RolloutActor(global={self.global_rank}/{self.cfg.orchestration.num_inference_workers})[local={self.local_rank}/{self.cfg.inference.tensor_parallel_dim})]"
 
 
-# is RewardActor possibly a better name for this?
+# TODO - is RewardActor possibly a better name for this?
 class PostProcessingActor(Actor):
+    """An actor responsible for post-processing rollout trajectories."""
+
     def __init__(
         self,
         global_rank: int,
@@ -1070,18 +1080,23 @@ class PostProcessingActor(Actor):
         self.replay_buffer = replay_buffer
         self.metric_actor = metric_actor
         self.global_rank = global_rank
-        self.logger = get_logger()
         self.local_rank = current_rank()["gpus"]
         self._is_actor_zero = self.local_rank == 0
 
     @endpoint
     async def initialize(self):
-        self.logger.info("initializing")
+        """Initializes the post-processing actor's components.
+
+        This method sets up the tokenizer, device, and other necessary components
+        for processing trajectories and computing rewards.
+        """
+        logger = get_logger()
+        logger.info("initializing")
         self._tokenizer = config.instantiate(self.cfg.tokenizer)
         device_index = get_device_index(
             "postprocessing", self.local_rank, self.global_rank, self.cfg
         )
-        self.logger.info("device_index: {}".format(device_index))
+        logger.info("device_index: {}".format(device_index))
         os.environ["CUDA_VISIBLE_DEVICES"] = str(device_index)
         self._device = torch.device("cuda:{}".format(device_index))
         torch.cuda.set_device(self._device)
@@ -1100,9 +1115,17 @@ class PostProcessingActor(Actor):
         self.STOP_TOKENS_TENSOR = torch.tensor(
             self._tokenizer.stop_tokens, device=self._device
         )
-        self.logger.info("done with init!")
+        logger.info("done with init!")
 
     def _build_reference_model(self) -> torch.nn.Module:
+        """Builds and returns the reference model for reward computation.
+
+        This method initializes the reference model, loads its state, and prepares it
+        for evaluation.
+
+        Returns:
+            torch.nn.Module: The initialized reference model
+        """
         ref_checkpointer = config.instantiate(
             self.cfg.postprocessing.ref_checkpointer, resume_from_checkpoint=False
         )
@@ -1143,7 +1166,22 @@ class PostProcessingActor(Actor):
         successes_mean_per_func: torch.Tensor,
         reward_metadata: Dict[str, List[str]],
     ):
-        """Log metrics for the RefActor, only on actor zero."""
+        """Logs metrics for the post-processing actor.
+
+        This method logs various performance and reward metrics to the metric actor.
+
+        Args:
+            step_idx (int): Current step index
+            time_total_ref_step (float): Total time taken for the reference step
+            time_model_running (float): Time spent running the model
+            time_waiting_buffer (float): Time spent waiting for the buffer
+            rollout_queue_size (int): Size of the rollout queue
+            rewards_mean (torch.Tensor): Mean of the rewards
+            successes_mean (torch.Tensor): Mean of the successes
+            rewards_mean_per_func (torch.Tensor): Mean rewards per function
+            successes_mean_per_func (torch.Tensor): Mean successes per function
+            reward_metadata (Dict[str, List[str]]): Metadata about the rewards
+        """
         if not self._is_actor_zero:
             return
 
@@ -1210,9 +1248,13 @@ class PostProcessingActor(Actor):
 
     @endpoint
     async def run(self):
-        # hack to reset stream logs (vLLM hijacks it at some point)
-        self.logger = get_logger()
-        self.logger.info("running postprocessor")
+        """Runs the post-processing loop.
+
+        This method continuously processes trajectories from the rollout queue,
+        computes rewards, updates the replay buffer, and logs metrics.
+        """
+        logger = get_logger()
+        logger.info("running postprocessor")
 
         idx = 0
         with self._device:
@@ -1222,7 +1264,7 @@ class PostProcessingActor(Actor):
                 trajectory = None
                 while trajectory is None:
                     if self._is_actor_zero:
-                        self.logger.info("Getting from rollout_queue queue.")
+                        logger.info("Getting from rollout_queue queue.")
                     # TODO - revisit this to check on failure conditions
                     trajectory = await self.rollout_queue_actor.get().call()
                     trajectory = trajectory.to(self._device)
@@ -1334,12 +1376,12 @@ class PostProcessingActor(Actor):
                     sequence_ids=trajectory.sequence_ids,
                 )
 
-                self.logger.info(f"Constructed trajectory: {trajectory}")
+                logger.info(f"Constructed trajectory: {trajectory}")
                 # Move tensors to CPU before putting into the queue
                 trajectory = trajectory.cpu()
 
                 # Update circular queue
-                self.logger.info("extending replay buffer")
+                logger.info("extending replay buffer")
                 await self.replay_buffer.extend(trajectory).call()
 
                 # End of step timing
@@ -1376,27 +1418,33 @@ class PostProcessingActor(Actor):
 
 
 class TrainingActor(Actor):
+    """An actor responsible for training models."""
+
     def __init__(
         self,
         cfg: DictConfig,
         metric_actor: MetricsLoggerActor,
         replay_buffer: ReplayBufferActor,
         param_store: ParameterStore,
-        address: str,
-        port: int,
+        dist_info: DistributedInfo,
     ):
         self.cfg = cfg
         self.local_rank = current_rank()["gpus"]
         self.metric_actor = metric_actor
         self.replay_buffer = replay_buffer
         self.param_store = param_store
-        self.logger = get_logger()
-        self._address = address
-        self._port = port
+        self._dist_info = dist_info
 
     @endpoint
     async def initialize(self):
-        self.logger.info("initializing trainer...")
+        """Initializes the training actor's components.
+
+        This method sets up the distributed environment, model, optimizer, and other
+        necessary components for training. It also initializes the process group for
+        distributed training and sets the device for computation.
+        """
+        logger = get_logger()
+        logger.info("initializing trainer...")
 
         # Distributed training setup: Simulate torchrun environment
         # Note - we allocate an extra GPU for the parameter server.
@@ -1406,12 +1454,12 @@ class TrainingActor(Actor):
             entity="training", local_rank=self.local_rank, global_rank=0, cfg=self.cfg
         )
         set_seed(self.cfg.seed)
-        self.logger.info("device index: {}".format(device_index))
+        logger.info("device index: {}".format(device_index))
         os.environ["CUDA_VISIBLE_DEVICES"] = str(device_index)
         os.environ["RANK"] = str(self.local_rank + 1)
-        os.environ["WORLD_SIZE"] = str(self.cfg.orchestration.num_training_workers + 1)
-        os.environ["MASTER_ADDR"] = str(self._address)
-        os.environ["MASTER_PORT"] = str(self._port)
+        os.environ["WORLD_SIZE"] = str(self._dist_info.world_size)
+        os.environ["MASTER_ADDR"] = str(self._dist_info.address)
+        os.environ["MASTER_PORT"] = str(self._dist_info.port)
 
         self._output_dir = self.cfg.output_dir
         self._log_every_n_steps = self.cfg.get("log_every_n_steps", 1)
@@ -1425,7 +1473,7 @@ class TrainingActor(Actor):
         self._device = torch.device("cuda:{}".format(device_index))
         torch.cuda.set_device(self._device)
 
-        self.logger.info(
+        logger.info(
             f"distributed init: rank: {os.environ['RANK']}, world_size: {os.environ['WORLD_SIZE']}, addr: {os.environ['MASTER_ADDR']}, port: {os.environ['MASTER_PORT']}, visible devices: {os.environ['CUDA_VISIBLE_DEVICES']}, backend: {self.distributed_backend}"
         )
         if not torch.distributed.is_initialized():
@@ -1466,7 +1514,6 @@ class TrainingActor(Actor):
 
         self._dtype = training.get_dtype("bf16", device=self._device)
         # Recipe state
-        # self.seed = training.set_seed(seed=self.cfg.training.seed)
         self.global_step = 0
         self._steps_run = 0
         self._total_dialog_turns = self.cfg.orchestration.num_steps
@@ -1518,12 +1565,13 @@ class TrainingActor(Actor):
         # Debugging configuration
         self.debug_logging_enabled = self.cfg.get("debug_logging_enabled", True)
         self.debug_num_samples_per_step = self.cfg.get("debug_num_samples_per_step", 2)
-        self.logger.info("done with init")
+        logger.info("done with init")
 
     def _setup_profiler(
         self, cfg_profiler: Optional[DictConfig] = None
     ) -> torch.profiler.profile | DummyProfiler:
         """Set up the profiler based on the configuration. Returns DummyProfiler if not enabled."""
+        logger = get_logger()
         if cfg_profiler is None:
             cfg_profiler = DictConfig({"enabled": False})
 
@@ -1537,7 +1585,7 @@ class TrainingActor(Actor):
 
         profiler, profiler_cfg = config.instantiate(cfg_profiler)
         if self._is_rank_zero:
-            self.logger.info(f"Profiler config after instantiation: {profiler_cfg}")
+            logger.info(f"Profiler config after instantiation: {profiler_cfg}")
             self.profiler_profile_memory = profiler_cfg.get("profile_memory", False)
             if profiler_cfg["enabled"]:
                 self.profiler_wait_steps = profiler_cfg["wait_steps"]
@@ -1566,8 +1614,9 @@ class TrainingActor(Actor):
            b. All ranks calls ``load_state_dict`` without peaking CPU RAMs since
               full state dicts are loaded with ``torch.load(mmap=True)``
         """
+        logger = get_logger()
         if self._is_rank_zero:
-            self.logger.info(
+            logger.info(
                 "FSDP is enabled. Instantiating model and loading checkpoint on Rank 0..."
             )
 
@@ -1612,7 +1661,7 @@ class TrainingActor(Actor):
         )
 
         if self._is_rank_zero:
-            self.logger.info(
+            logger.info(
                 f"Instantiating model and loading checkpoint took {time.perf_counter() - time_setup_start:.2f} secs"
             )
 
@@ -1636,8 +1685,9 @@ class TrainingActor(Actor):
     ) -> torch.optim.Optimizer:
         """Initialize the optimizer."""
         optimizer = config.instantiate(cfg_optimizer, self._model.parameters())
+        logger = get_logger()
         if self._is_rank_zero:
-            self.logger.info("Optimizer is initialized.")
+            logger.info("Optimizer is initialized.")
         return optimizer
 
     def grpo_step(
@@ -1861,7 +1911,7 @@ class TrainingActor(Actor):
         async def _log_table(data: list, table_name: str) -> None:
             """Helper function to log table data to WandB."""
             if data:
-                self.logger.info(f"Logging {table_name} for step {self._steps_run}")
+                logger.info(f"Logging {table_name} for step {self._steps_run}")
                 columns = list(data[0].keys())
                 table_data = []
                 for row in data:
@@ -1871,9 +1921,7 @@ class TrainingActor(Actor):
                     table_data, columns, table_name, step=self._steps_run
                 ).call()
             else:
-                self.logger.info(
-                    f"Failed to log {table_name} for step {self._steps_run}"
-                )
+                logger.info(f"Failed to log {table_name} for step {self._steps_run}")
 
         # Determine the number of samples to log
         num_samples = min(
@@ -2019,10 +2067,10 @@ class TrainingActor(Actor):
 
     @endpoint
     async def run(self):
-        """Execute the GRPO training loop."""
+        """Executes the GRPO training loop."""
         with self._device:
-            self.logger = get_logger()
-            self.logger.info("Starting GRPO training loop...")
+            logger = get_logger()
+            logger.info("Starting GRPO training loop...")
             training.cleanup_before_training()
             self._optimizer.zero_grad()
             self._profiler.start()
@@ -2048,7 +2096,7 @@ class TrainingActor(Actor):
                 num_waits = 0
                 while await self.replay_buffer.is_empty().call():
                     if self._is_rank_zero and num_waits % 10 == 0:
-                        self.logger.info("waiting for replay buffer...")
+                        logger.info("waiting for replay buffer...")
                     await asyncio.sleep(1)
                     num_waits += 1
 
@@ -2057,9 +2105,7 @@ class TrainingActor(Actor):
                 trajectory = trajectory.to(self._device)
                 time_waiting_buffer = time.perf_counter() - time_waiting_buffer_start
                 if self._is_rank_zero:
-                    self.logger.info(
-                        f"{self.local_rank=} got from queue traj {trajectory}"
-                    )
+                    logger.info(f"{self.local_rank=} got from queue traj {trajectory}")
 
                 # Prepare trajectory for optimization
                 prepared_trajectory, context_length, metadata = (
@@ -2094,7 +2140,7 @@ class TrainingActor(Actor):
                     if self._lr_scheduler is not None:
                         self._lr_scheduler.step()
 
-                self.logger.info(f"{self.local_rank=} finished step {self._steps_run}")
+                logger.info(f"{self.local_rank=} finished step {self._steps_run}")
                 time_grpo_steps = time.perf_counter() - time_grpo_steps_start
                 self._steps_run += 1
 
@@ -2120,12 +2166,12 @@ class TrainingActor(Actor):
                     torch.cuda.synchronize()
                     time_weight_gather = time.perf_counter() - time_weight_gather_start
                     if self._is_rank_zero:
-                        self.logger.info(f"Done gather in {time_weight_gather}")
+                        logger.info(f"Done gather in {time_weight_gather}")
                     time_sync_start = time.perf_counter()
                     await self.sync_weights(gathered_sd)
                     time_weight_sync = time.perf_counter() - time_sync_start
                     if self._is_rank_zero:
-                        self.logger.info(f"Done sync in {time_weight_sync}")
+                        logger.info(f"Done sync in {time_weight_sync}")
 
                 # Log metrics
                 total_step_time = time.perf_counter() - time_step_start
@@ -2182,7 +2228,8 @@ class TrainingActor(Actor):
 
     async def sync_weights(self, new_sd):
         self.policy_version += 1
-        self.logger.info("syncing weights w/ PS at {}".format(self.policy_version))
+        logger = get_logger()
+        logger.info("syncing weights w/ PS at {}".format(self.policy_version))
         # TODO - replace w/ rdmabuffer
         if self._is_rank_zero:
             h = self.param_store.put(version=self.policy_version).call()
@@ -2194,7 +2241,7 @@ class TrainingActor(Actor):
             await h
         else:
             torch.distributed.barrier()
-        self.logger.info("done weight syncs w/ PS")
+        logger.info("done weight syncs w/ PS")
 
     def _prepare_trajectory(
         self, raw_trajectory: Trajectory
@@ -2283,37 +2330,26 @@ class TrainingActor(Actor):
 # ========= Recipe =========
 class MonarchGRPORecipe(OrchestrationRecipeInterface):
     async def setup(self, cfg: DictConfig) -> None:
-        self.logger = get_logger()
-        self.logger.info("initializing w/ config: ", cfg)
+        logger = get_logger()
         self.cfg = cfg
-
         # Set seed if not already set...
         if not self.cfg.seed:
             self.cfg.seed = random.randint(0, 2**32 - 1)
+
+        logger.info("Initializing w/ config: ", cfg)
 
         self.num_inference_workers = cfg.orchestration.num_inference_workers
         self.num_postprocessing_workers = cfg.orchestration.num_postprocessing_workers
         self.num_training_workers = cfg.orchestration.num_training_workers
 
-        enable_nccl_debug = False
-        if enable_nccl_debug:
-            env = {
-                "NCCL_DEBUG": "INFO",
-                "CUDA_LAUNCH_BLOCKING": "1",
-                "NCCL_DEBUG_SUBSYS": "ALL",
-                "NCCL_ASYNC_ERROR_HANDLING": "1",
-            }
-        else:
-            env = {}
+        env = {}
 
-        # We want to create distributed groups for:
-        # 1) all rollout workers and
-        # 2) trainers
+        # Create addresses and ports for trainer and worker distirbuted worlds.
         addresses = [get_ip() for _ in range(self.num_inference_workers + 1)]
-        # addresses = ["localhost" for _ in range(self.num_inference_workers + 1)]
         ports = [get_open_port() for _ in range(self.num_inference_workers + 1)]
-        self.logger.info("addresses: {}".format(addresses))
-        self.logger.info("ports: {}".format(ports))
+        logger.info("Using addresses: {}".format(addresses))
+        logger.info("Using ports: {}".format(ports))
+
         trainer_address = addresses[0]
         trainer_port = ports[0]
         vllm_addresses = addresses[1:]
@@ -2321,24 +2357,24 @@ class MonarchGRPORecipe(OrchestrationRecipeInterface):
 
         # singleton_proc_mesh is the designated proc where
         # global entities (metric logger, queue) are spawned.
-        # TODO - consider splitting these into their own procs
+        # If any of these components cause stalls, we can move them out to their own procs.
         self.singleton_proc_mesh = await proc_mesh(
             gpus=1,
             env=env,
         )
-        self.logger.info("spawning metric actor")
+        logger.info("spawning metric actor")
         self.metric_actor = await self.singleton_proc_mesh.spawn(
             "metrics", MetricsLoggerActor, cfg=cfg
         )
-        self.logger.info("spawning rollout actor")
+        logger.info("spawning rollout actor")
         self.rollout_queue_actor = await self.singleton_proc_mesh.spawn(
             "queue", QueueActor
         )
-        self.logger.info("spawning replay buffer actor")
+        logger.info("spawning replay buffer actor")
         self.replay_buffer_actor = await self.singleton_proc_mesh.spawn(
             "replay_buffer", ReplayBufferActor, cfg=cfg
         )
-        self.logger.info("spawning param server actor")
+        logger.info("spawning param server actor")
 
         self.param_store_proc_mesh = await proc_mesh(
             gpus=1,
@@ -2358,7 +2394,7 @@ class MonarchGRPORecipe(OrchestrationRecipeInterface):
         self.weight_updater_actors = []
         inference_tp = cfg.inference.tensor_parallel_dim
 
-        self.logger.info(
+        logger.info(
             f"[rollout] Creating {self.num_inference_workers} meshes of size {inference_tp}..."
         )
         for i in range(self.num_inference_workers):
@@ -2368,30 +2404,30 @@ class MonarchGRPORecipe(OrchestrationRecipeInterface):
                     env=env,
                 )
             )
+            dist_info = DistributedInfo(
+                address=vllm_addresses[i],
+                port=vllm_ports[i],
+                world_size=inference_tp + 1,
+            )
             generator = await self.rollout_proc_meshes[i].spawn(
                 "rollout_actors",
                 RolloutActor,
                 global_rank=i,
                 cfg=cfg,
-                address=vllm_addresses[i],
-                port=vllm_ports[i],
+                dist_info=dist_info,
                 metric_actor=self.metric_actor,
                 rollout_queue_actor=self.rollout_queue_actor,
                 param_store=self.param_store_actor,
             )
             self.rollout_actor_meshes.append(generator)
-            self.dist_info_map[generator] = DistributedInfo(
-                address=vllm_addresses[i],
-                port=vllm_ports[i],
-                world_size=inference_tp + 1,
-            )
+            self.dist_info_map[generator] = dist_info
 
         # Create postprocess actors and meshes
         self.postprocess_proc_meshes = []
         self.postprocess_actor_meshes = []
 
         postprocess_tp = self.cfg.postprocessing.tensor_parallel_dim
-        self.logger.info(
+        logger.info(
             f"[postprocess] Creating {self.num_postprocessing_workers} meshes of size {postprocess_tp}..."
         )
         for i in range(self.num_postprocessing_workers):
@@ -2415,11 +2451,18 @@ class MonarchGRPORecipe(OrchestrationRecipeInterface):
 
         # Create training actors and meshes
         training_shards = self.cfg.orchestration.num_training_workers
-        self.logger.info(f"[training] Creating mesh of size {training_shards}...")
+        logger.info(f"[training] Creating mesh of size {training_shards}...")
         self.training_mesh = await proc_mesh(
             gpus=training_shards,
             env=env,
         )
+
+        train_dist_info = DistributedInfo(
+            address=trainer_address,
+            port=trainer_port,
+            world_size=cfg.orchestration.num_training_workers + 1,
+        )
+
         self.training_actor = await self.training_mesh.spawn(
             "training",
             TrainingActor,
@@ -2427,14 +2470,9 @@ class MonarchGRPORecipe(OrchestrationRecipeInterface):
             metric_actor=self.metric_actor,
             replay_buffer=self.replay_buffer_actor,
             param_store=self.param_store_actor,
-            address=trainer_address,
-            port=trainer_port,
+            dist_info=train_dist_info,
         )
-        self.dist_info_map[self.training_actor] = DistributedInfo(
-            address=trainer_address,
-            port=trainer_port,
-            world_size=cfg.orchestration.num_training_workers + 1,
-        )
+        self.dist_info_map[self.training_actor] = train_dist_info
         self.actor_set = ActorSet(
             param_store=self.param_store_actor,
             metric_logger=self.metric_actor,
@@ -2449,7 +2487,8 @@ class MonarchGRPORecipe(OrchestrationRecipeInterface):
         )
 
     async def run(self):
-        self.logger.info("initializing actors")
+        logger = get_logger()
+        logger.info("initializing actors")
         await asyncio.gather(
             *[a.initialize().broadcast_and_wait() for a in self.all_actors]
             + [
@@ -2458,11 +2497,12 @@ class MonarchGRPORecipe(OrchestrationRecipeInterface):
                 ).broadcast_and_wait()
             ]
         )
-        self.logger.info("running actors")
+        logger.info("running actors")
         await asyncio.gather(*[a.run().broadcast_and_wait() for a in self.all_actors])
 
     async def cleanup(self):
-        self.logger.info("cleaning up")
+        logger = get_logger()
+        logger.info("cleaning up")
 
     def __repr__(self) -> str:
         return "MonarchGRPORecipeRunner"
