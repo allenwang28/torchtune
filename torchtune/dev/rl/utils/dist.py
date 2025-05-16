@@ -27,5 +27,6 @@ def stateless_init_process_group(
     pg = StatelessProcessGroup.create(
         host=master_address, port=master_port, rank=rank, world_size=world_size
     )
+
     pynccl = PyNcclCommunicator(pg, device=device)
     return pynccl
