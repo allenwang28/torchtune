@@ -2,12 +2,13 @@ import asyncio
 import inspect
 import logging
 import os
+import random
 import time
 from functools import partial
 
 from typing import Any, Callable, Dict, Generic, List, Optional, TypeVar
 
-# import aiorwlock
+import numpy as np
 
 import torch
 import torch.distributed
@@ -59,6 +60,12 @@ def get_ip():
         return "127.0.0.1"
     finally:
         s.close()
+
+
+def set_seed(seed: int):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
 
 
 # ========= Constants =========
@@ -289,6 +296,7 @@ class ParameterServerActor(Actor):
         os.environ["MASTER_PORT"] = str(self._trainer_port)
         self.device = torch.device("cuda:0")
         torch.cuda.set_device(self.device)
+        set_seed(self.cfg.seed)
 
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(backend="nccl", rank=0)
@@ -398,7 +406,11 @@ class ParameterServerActor(Actor):
         torch.cuda.synchronize()
         self.vllm_weight_versions[worker_id] = self.version
         self.state_dict_lock.release()
-        self.logger.info("done syncing weights with worker {}. new version {}".format(worker_id, self.version))
+        self.logger.info(
+            "done syncing weights with worker {}. new version {}".format(
+                worker_id, self.version
+            )
+        )
         return self.version
 
     @endpoint
@@ -487,7 +499,11 @@ class VLLMHFWeightUpdateReceiver(WeightUpdateReceiverBase):
             # logger.info("broadcast: {}".format(k))
             inference_server.collective_rpc("update_weight", args=(k, dtype, shape))
 
-        logger.info("worker {} done with broadcasts, waiting for version".format(self.worker_idx))
+        logger.info(
+            "worker {} done with broadcasts, waiting for version".format(
+                self.worker_idx
+            )
+        )
         version = await fut
         logger.info("worker {} done with update".format(self.worker_idx))
         return version
@@ -966,6 +982,7 @@ class RolloutActor(Actor):
         # The following env variables help guarantee GPU isolation
         gpu_indices = ",".join(str(idx) for idx in gpu_indices)
         os.environ["LOCAL_RANK"] = str(self.local_rank)
+        set_seed(self.cfg.seed)
         # os.environ["CUDA_VISIBLE_DEVICES"] = gpu_indices
 
         weight_update_receiver = VLLMHFWeightUpdateReceiver(
@@ -1047,6 +1064,7 @@ class PostProcessingActor(Actor):
         os.environ["CUDA_VISIBLE_DEVICES"] = str(device_index)
         self._device = torch.device("cuda:{}".format(device_index))
         torch.cuda.set_device(self._device)
+        set_seed(self.cfg.seed)
         self._dtype = training.get_dtype("bf16", device=self._device)
         self._ref_model = self._build_reference_model()
         self._temperature = self.cfg.inference.temperature
@@ -1366,6 +1384,7 @@ class TrainingActor(Actor):
         device_index = get_device_index(
             entity="training", local_rank=self.local_rank, global_rank=0, cfg=self.cfg
         )
+        set_seed(self.cfg.seed)
         self.logger.info("device index: {}".format(device_index))
         os.environ["CUDA_VISIBLE_DEVICES"] = str(device_index)
         os.environ["RANK"] = str(self.local_rank + 1)
@@ -2250,6 +2269,10 @@ class MonarchGRPORecipe(OrchestrationRecipeInterface):
         self.logger = get_logger()
         self.logger.info("initializing w/ config: ", cfg)
         self.cfg = cfg
+
+        # Set seed if not already set...
+        if not self.cfg.seed:
+            self.cfg.seed = random.randint(0, 2**32 - 1)
 
         self.num_inference_workers = cfg.orchestration.num_inference_workers
         self.num_postprocessing_workers = cfg.orchestration.num_postprocessing_workers

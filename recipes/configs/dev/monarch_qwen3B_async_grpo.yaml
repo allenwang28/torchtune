@@ -18,6 +18,8 @@
 name: grpo_async_qwen3b
 output_dir: /tmp/checkpoints/${name}
 base_model_path: /tmp/Qwen2.5-3B
+# Note - moved seed out to the top level so the entire run can share a seed.
+seed: null
 
 # Model architecture (Qwen2.5-3B)
 model:
@@ -96,7 +98,6 @@ training:
     _component_: torchtune.dev.rl.linear_grpo_loss.LinearGRPOLoss
     kl_coeff: 0.01
     epsilon: 0.2
-  seed: null
 
 # All logging args
 metric_logger:
