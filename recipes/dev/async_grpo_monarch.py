@@ -21,6 +21,7 @@ from tensordict import lazy_stack, NonTensorStack, TensorDict, TensorDictBase
 from tensordict.utils import expand_as_right
 from torchdata.stateful_dataloader import StatefulDataLoader
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
+
 from torchrl.collectors import (
     SyncDataCollector,
     WeightUpdateReceiverBase,
@@ -30,6 +31,7 @@ from torchrl.collectors import (
 from torchrl.data import LazyStackStorage, ReplayBuffer
 from torchtune import config, generation, rlhf, utils
 from torchtune.dev.rl.datatypes import RequestOutput, Trajectory
+from torchtune.dev.rl.monarch_actors import get_logger, MetricsLoggerActor
 from torchtune.dev.rl.rewards import batched_rewards
 from torchtune.dev.rl.types import GRPOStats, GRPOTrajectory
 
@@ -47,6 +49,7 @@ from vllm.worker.worker import Worker
 T = TypeVar("T")
 
 
+# ========= Common functions =========
 def get_ip():
     import socket
 
@@ -72,95 +75,6 @@ def set_seed(seed: int):
 _TOK_RESPONSE_KEY = "tokens_response"
 _TEXT_RESPONSE_KEY = "text_response"
 _LOG_PROBS_KEY = "log_probs"
-
-
-# ========= Logging related components =========
-class MetricsLoggerActor(Actor):
-    """Metrics logger for all actors."""
-
-    def __init__(self, cfg):
-        self.logger = config.instantiate(cfg.metric_logger)
-        self.logger.log_config(cfg)
-
-    @endpoint
-    async def log_dict(self, log_dict, step=None):
-        # allowing actors to use their own step counters
-        self.logger.log_dict(log_dict, step=step)
-
-    @endpoint
-    async def log_table(self, table_data, columns, table_name, step=None):
-        """Log a table to WandB."""
-        import wandb
-
-        table = wandb.Table(columns=columns, data=table_data)
-        self.logger.log_dict({table_name: table}, step=step)
-
-    @endpoint
-    async def close(self):
-        if hasattr(self.logger, "close"):
-            self.logger.close()
-
-
-class MonarchLogger(logging.Logger):
-    """A custom logger class that adds the caller representation to the log message."""
-
-    # ANSI color codes
-    BLUE = "\033[94m"
-    RESET = "\033[0m"
-
-    def __init__(self, name, level=logging.NOTSET):
-        super().__init__(name, level)
-        handler = logging.StreamHandler()
-        formatter = logging.Formatter(
-            "%(levelname)s %(asctime)s - %(message)s", "%m-%d %H:%M:%S"
-        )
-        handler.setFormatter(formatter)
-        self.addHandler(handler)
-
-    def _log(
-        self,
-        level,
-        msg,
-        args,
-        exc_info=None,
-        extra=None,
-        stack_info=False,
-        stacklevel=1,
-    ):
-        caller_frame = inspect.stack()[2]
-        caller_self = caller_frame.frame.f_locals.get("self")
-        caller_function = caller_frame.function
-
-        # Get current timestamp
-        timestamp = time.strftime("%m-%d %H:%M:%S")
-        level_name = logging.getLevelName(level)
-
-        try:
-            if caller_self:
-                if caller_self.__class__.__repr__ is object.__repr__:
-                    class_name = caller_self.__class__.__name__
-                    try:
-                        gpu_rank = current_rank()["gpus"]
-                        num_gpus = current_size()["gpus"]
-                        caller_repr = f"{class_name}-({gpu_rank}{num_gpus})"
-                    except Exception as e:
-                        caller_repr = class_name
-                else:
-                    caller_repr = str(caller_self)
-                msg = f"{self.BLUE}{level_name} {timestamp} - [Monarch::{caller_repr}::{caller_function}]{self.RESET} {msg}"
-        except Exception:
-            msg = f"{self.BLUE}{level_name} {timestamp} - [Monarch::{caller_function}]{self.RESET} {msg}"
-        super()._log(level, msg, args, exc_info, extra, stack_info, stacklevel)
-
-
-def get_logger() -> logging.Logger:
-    logging.setLoggerClass(MonarchLogger)
-    logger = logging.getLogger(__name__)
-    if logger.hasHandlers():
-        logger.handlers.clear()
-        logger.addHandler(logging.StreamHandler())
-    logger.setLevel(logging.INFO)
-    return logger
 
 
 # ========= Generic data structures + functionality =========
