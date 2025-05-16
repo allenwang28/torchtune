@@ -1,9 +1,8 @@
 import asyncio
-import inspect
-import logging
 import os
 import random
 import time
+from dataclasses import dataclass
 from functools import partial
 
 from typing import Any, Callable, Dict, Generic, List, Optional, TypeVar
@@ -81,19 +80,33 @@ _LOG_PROBS_KEY = "log_probs"
 def get_device_index(
     entity: str, local_rank: int, global_rank: int, cfg: DictConfig
 ) -> int:
-    """Returns the torch.device for the given entity/rank/config.
+    """Returns the device index for the given entity and rank.
 
-    Maps logical entity ranks to physical GPU indices based on entity type and configuration.
-    For rollout workers, GPUs are assigned starting at index 0.
-    For postprocessing workers, GPUs are assigned after all rollout worker GPUs.
+    This function maps logical entity ranks to physical GPU indices based on entity type and configuration.
+
+    Args:
+        entity: The type of entity ("param_store", "training", "rollout", or "postprocessing")
+        local_rank: The local rank within the entity's process group
+        global_rank: The global rank of the entity (used for multiple workers of same type)
+        cfg: The configuration object containing orchestration settings
+
+    Returns:
+        int: The physical GPU device index to use
+
+    Note:
+        The device assignment follows this pattern:
+        - Parameter server: Uses 1 GPU at the beginning
+        - Training workers: Use num_training_workers GPUs after the parameter server
+        - Rollout workers: Each worker uses tensor_parallel_dim GPUs, with multiple workers
+        - Postprocessing workers: Each worker uses tensor_parallel_dim GPUs, with multiple workers
 
     This is a placeholder implementation for now, and would need to change in a multi-host setting.
     """
     trainer_world_size = cfg.orchestration.num_training_workers
     trainer_offset = trainer_world_size
 
-    param_server_world_size = 1
-    param_server_offset = param_server_world_size
+    param_store_world_size = 1
+    param_store_offset = param_store_world_size
 
     rollout_world_size = cfg.inference.tensor_parallel_dim
     num_rollout_workers = cfg.orchestration.num_inference_workers
@@ -105,18 +118,18 @@ def get_device_index(
 
     entity_world_size = -1
 
-    if entity == "param_server":
-        entity_world_size = param_server_world_size
+    if entity == "param_store":
+        entity_world_size = param_store_world_size
         offset = 0
     elif entity == "training":
         entity_world_size = trainer_world_size
-        offset = param_server_offset
+        offset = param_store_offset
     elif entity == "rollout":
         entity_world_size = rollout_world_size
-        offset = trainer_offset + param_server_offset
+        offset = trainer_offset + param_store_offset
     elif entity == "postprocessing":
         entity_world_size = postprocessing_world_size
-        offset = trainer_offset + param_server_offset + rollout_offset
+        offset = trainer_offset + param_store_offset + rollout_offset
     else:
         raise KeyError(f"Unknown entity: {entity}")
     return offset + global_rank * entity_world_size + local_rank
@@ -172,181 +185,288 @@ class ReplayBufferActor(Actor):
 
 
 # ========= Cabernet actors + data structures=========
-class ParameterServerActor(Actor):
-    def __init__(
-        self,
-        cfg: DictConfig,
-        vllm_master_addresses: list[str],
-        vllm_master_ports: list[int],
-        trainer_addr: str,
-        trainer_port: int,
-    ):
-        super().__init__()
-        self.cfg = cfg
-        self._vllm_master_addresses = vllm_master_addresses
-        self._vllm_master_ports = vllm_master_ports
-        self._trainer_addr = trainer_addr
-        self._trainer_port = trainer_port
-        self.vllm_comm_groups = dict()
-        self.vllm_weight_versions = dict()
-        self.vllm_worker_handles = dict()
-        self.logger = get_logger()
-        self.local_rank = current_rank()["gpus"]
+
+# ========= Generic actor definitions and their verbs =========
+
+
+class Generator(Actor):
+    pass
+
+
+class ParameterStore(Actor):
+    @endpoint
+    async def get(self, generator: Generator | int) -> int:
+        """Transmits weights from the parameter store to the generator.
+
+        Returns:
+            The policy version
+        """
+        raise NotImplementedError
 
     @endpoint
-    async def initialize(self):
-        self.logger.info("Initializing parameter server...")
-        device_index = get_device_index("param_server", 0, 0, self.cfg)
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(device_index)
-        self.logger.info("device index: {}".format(device_index))
-        # Note: the parameter server facilitates comms between the trainers
-        # and generators. Here, we register the parameter server as
-        # a member of the trainer groups.
-        trainer_world_size = self.cfg.orchestration.num_training_workers
-        os.environ["RANK"] = str(0)
-        # world size = trainer world size + 1
-        os.environ["WORLD_SIZE"] = str(trainer_world_size + 1)
-        os.environ["MASTER_ADDR"] = str(self._trainer_addr)
-        os.environ["MASTER_PORT"] = str(self._trainer_port)
-        self.device = torch.device("cuda:0")
+    async def put(self, version: int):
+        """Transmits weights from the trainer to the parameter store."""
+        raise NotImplementedError
+
+    @endpoint
+    async def get_version(self) -> int:
+        """Returns the current version."""
+        raise NotImplementedError
+
+    @endpoint
+    async def get_generator_model_metadata(
+        self,
+    ) -> dict[str, tuple[torch.dtype, torch.Size]]:
+        """Returns the model's state dict metadata."""
+        raise NotImplementedError
+
+
+class Trainer(Actor):
+    pass
+
+
+@dataclass
+class ActorSet:
+    """A dataclass that conveniently packages all actors."""
+
+    param_store: ParameterStore
+    metric_logger: MetricsLoggerActor
+    trainer: Trainer
+    generators: list[Generator]
+
+
+@dataclass
+class DistributedInfo:
+    """A representation for torch.distributed world size."""
+
+    address: str
+    port: int
+    world_size: int
+
+
+class HFVLLMParameterServer(ParameterStore):
+    """A parameter server that manages model weights for HuggingFace models used with vLLM.
+
+    This server acts as a central repository for model weights, facilitating weight sharing
+    between trainers and generators. It handles the conversion between TorchTune's
+    internal model format and HuggingFace's format required by vLLM inference workers.
+
+    Communications are facilitated primarily over NCCL, using torch.distributed. As such,
+    synchronization mechanisms are required to ensure consistency across reads and writes.
+
+    The server maintains version tracking to ensure consistency across the distributed system
+    and provides synchronization mechanisms to safely update and distribute weights.
+
+    Attributes:
+        cfg (DictConfig): Configuration for the parameter server
+        state_dict (dict): The model's state dictionary in TorchTune format
+        hf_state_dict (dict): The model's state dictionary converted to HuggingFace format
+        lock (asyncio.Lock): Lock to prevent concurrent weight updates
+        version (int): Current version of the model weights
+        _model_metadata (dict): Metadata about model tensors (shapes and dtypes)
+        _generator_channel_map (dict): Mapping between generators and communication channels
+    """
+
+    def __init__(self, cfg: DictConfig):
+        self.cfg = cfg
+
+    @endpoint
+    async def initialize(
+        self,
+        actor_set: ActorSet,
+        dist_info_map: dict[Actor, DistributedInfo],
+    ):
+        """Initialize the parameter server and establish connections with trainers and generators.
+
+        This method:
+        1. Sets up the device for the parameter server
+        2. Establishes distributed connections with trainers and generators
+        3. Loads the initial model checkpoint
+        4. Converts weights to HuggingFace format for vLLM compatibility
+        5. Creates model metadata for efficient weight synchronization
+
+        Args:
+            actor_set (ActorSet): Set of actors in the system (trainers, generators, etc.)
+            dist_info_map (dict): Mapping of actors to their distributed communication info
+        """
+        self.device_index = get_device_index("param_store", 0, 0, self.cfg)
+        logger = get_logger()
+        logger.info("assigned device index: %d", self.device_index)
+        self.device = torch.device("cuda:{}".format(self.device_index))
         torch.cuda.set_device(self.device)
-        set_seed(self.cfg.seed)
 
-        if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(backend="nccl", rank=0)
-        self.rank = int(os.environ["RANK"])
-        self.world_size = int(os.environ["WORLD_SIZE"])
-        assert self.rank == 0
-        self.logger.info("loading checkpoint...")
+        # A map between the generator and connection channel
+        self.generators = actor_set.generators
+        self._generator_channel_map = {}
 
-        # load the empty model / state dict
-        # Since we're broadcasting the trainer's weights, we can simply load
-        # the model definition using the same checkpointing mechanics as the trainer.
+        self._connect_to_trainer(dist_info=dist_info_map[actor_set.trainer])
+        for generator in actor_set.generators:
+            self._connect_to_generator(
+                generator=generator, dist_info=dist_info_map[generator]
+            )
+
+        logger.info(
+            "Parameter server is initialized, with all components connected. Loading model metadata..."
+        )
+        # Load model information
         checkpointer = config.instantiate(
             self.cfg.training.checkpointer, resume_from_checkpoint=False
         )
-        self.state_dict = checkpointer.load_checkpoint()[training.MODEL_KEY]
-
-        for k, v in self.state_dict.items():
-            self.state_dict[k] = v.to(self.device)
-        self.logger.info("checkpoint loaded")
+        self.train_state_dict = checkpointer.load_checkpoint()[training.MODEL_KEY]
+        for k, v in self.train_state_dict.items():
+            # Move to GPU so NCCL communication actually works
+            self.train_state_dict[k] = v.to(self.device)
+        logger.info("checkpoint loaded")
 
         # aiorwlock may be better here, it just doesn't play well with Monarch for some reason...
-        # self.state_dict_lock = aiorwlock.RWLock()
-        self.state_dict_lock = asyncio.Lock()
+        # self.lock = aiorwlock.RWLock()
+        self.lock = asyncio.Lock()
         self.version = 0
-        self.version_tensor = torch.tensor([0], device="cuda")
 
         # Create model metadata
-        self.hf_state_dict = self._maybe_map_weights(self.state_dict)
+        self.hf_state_dict = self._prepare_hf_weights()
         self._model_metadata = {
             k: (v.dtype, v.shape) for k, v in self.hf_state_dict.items()
         }
-        self.logger.info("done with init")
+        logger.info("Done with initialization!")
 
     @endpoint
-    async def acquire_write_lock(self):
-        await self.state_dict_lock.acquire()
+    async def get_generator_model_metadata(
+        self,
+    ) -> dict[str, tuple[torch.dtype, torch.Size]]:
+        """Get metadata about the model's tensors to prepare for weight synchronization.
 
-    @endpoint
-    async def release_write_lock(self):
-        self.version += 1
-        self.version_tensor += 1
-        torch.cuda.synchronize()
-        self.state_dict_lock.release()
+        Returns:
+            dict: Mapping of parameter names to tuples of (dtype, shape)
+        """
+        return self._model_metadata
 
-    def _get_server_weights(self):
-        return self.state_dict
+    def _prepare_hf_weights(self) -> dict[str, torch.Tensor]:
+        """Convert TorchTune model weights to HuggingFace format.
 
-    def _maybe_map_weights(self, state_dict: dict[str, torch.Tensor]):
-        sd = qwen2_tune_to_hf(state_dict, num_heads=16, num_kv_heads=2, dim=2048)
+        This method transforms the internal state dictionary to the format expected
+        by HuggingFace models used in vLLM, handling architecture-specific conversions.
+
+        Returns:
+            dict: The converted state dictionary in HuggingFace format
+        """
+        sd = qwen2_tune_to_hf(
+            self.train_state_dict, num_heads=16, num_kv_heads=2, dim=2048
+        )
         for k, v in sd.items():
             sd[k] = v.to(self.device)
         return sd
 
-    @endpoint
-    async def current_policy_version(self) -> int:
-        return self.version
+    def _connect_to_trainer(self, dist_info: DistributedInfo):
+        """Establish a distributed connection with the trainer.
 
-    @endpoint
-    async def skip_update(self, worker_id: int) -> bool:
-        if self.version == 0:
-            return True
-        if worker_id not in self.vllm_weight_versions:
-            return False
-        if self.vllm_weight_versions[worker_id] == self.version:
-            self.logger.info(
-                f"Skipping update for {worker_id=}, {self.version=}, {self.vllm_weight_versions[worker_id]=}"
-            )
-            return True
-        return False
+        Sets up the NCCL communication channel with the trainer for weight updates.
 
-    def _init_model_update_group(self, worker_id):
-        vllm_tp_size = self.cfg.inference.tensor_parallel_dim
-        weight_sync_world_size = vllm_tp_size + 1
+        Args:
+            dist_info (DistributedInfo): Connection information for the trainer
+        """
         logger = get_logger()
-        logger.info(
-            "initializing model update group: addr: {}, port: {}, rank: {}, world_size: {}, device: {}, visible devices: {}".format(
-                self._vllm_master_addresses[worker_id],
-                self._vllm_master_ports[worker_id],
-                0,
-                weight_sync_world_size,
-                self.device,
-                os.environ.get("CUDA_VISIBLE_DEVICES", None),
-            )
+        logger.info("Connecting to trainer...")
+        os.environ["WORLD_SIZE"] = str(dist_info.world_size)
+        os.environ["MASTER_ADDR"] = str(dist_info.address)
+        os.environ["MASTER_PORT"] = str(dist_info.port)
+
+        assert (
+            not torch.distributed.is_initialized()
+        ), "Parameter server's distributed world was initialized twice, which is unexpected."
+
+        logger.info("Initializing torch distributed...")
+        torch.distributed.init_process_group(backend="nccl", rank=0)
+        logger.info("Done connecting to trainer")
+
+    def _connect_to_generator(self, generator: Actor, dist_info: DistributedInfo):
+        """Establish a distributed connection with a generator.
+
+        Sets up the NCCL communication channel with a generator for weight distribution.
+
+        Args:
+            generator (Actor): The generator actor to connect to
+            dist_info (DistributedInfo): Connection information for the generator
+        """
+        logger = get_logger()
+        logger.info("Connecting to generator {}".format(generator))
+        assert (
+            generator not in self._generator_channel_map
+        ), "Connection was already created between parameter serverand generator {}".format(
+            generator
         )
-        model_update_group = stateless_init_process_group(
-            master_address=self._vllm_master_addresses[worker_id],
-            master_port=self._vllm_master_ports[worker_id],
+        self._generator_channel_map[generator] = stateless_init_process_group(
+            master_address=dist_info.address,
+            master_port=dist_info.port,
+            # we assume that the parameter server is always rank 0 in server<>worker communications.
             rank=0,
-            world_size=weight_sync_world_size,
+            world_size=dist_info.world_size,
             device=self.device,
         )
-        self.vllm_comm_groups[worker_id] = model_update_group
+        logger.info("Done connecting to generator {}".format(generator))
 
     @endpoint
-    async def sync_weights_with_worker(self, worker_id: int) -> int:
+    async def get(self, generator: Generator | int) -> int:
+        """Send model weights to a generator.
+
+        Broadcasts the current HuggingFace-formatted weights to the specified generator
+        using the established communication channel.
+
+        Args:
+            generator (Generator): The generator (or its index) requesting weights
+
+        Returns:
+            int: The current version number of the weights
+        """
         logger = get_logger()
-        server_weights = self._maybe_map_weights(self._get_server_weights())
-        logger.info("syncing weights with worker {}".format(worker_id))
-        server_weights = self.hf_state_dict
-        if worker_id not in self.vllm_comm_groups:
-            self._init_model_update_group(worker_id)
-        await self.state_dict_lock.acquire()
-        for i, k in enumerate(sorted(server_weights.keys())):
-            self.vllm_comm_groups[worker_id].broadcast(
-                server_weights[k], src=0, stream=torch.cuda.current_stream()
+        if isinstance(generator, int):
+            generator = self.generators[generator]
+        logger.info("Sending weights to generator {}".format(generator))
+        await self.lock.acquire()
+        channel = self._generator_channel_map[generator]
+        for k in sorted(self.hf_state_dict.keys()):
+            channel.broadcast(
+                self.hf_state_dict[k], src=0, stream=torch.cuda.current_stream()
             )
         torch.cuda.synchronize()
-        self.vllm_weight_versions[worker_id] = self.version
-        self.state_dict_lock.release()
-        self.logger.info(
-            "done syncing weights with worker {}. new version {}".format(
-                worker_id, self.version
-            )
-        )
+        version = self.version
+        self.lock.release()
+        return version
+
+    @endpoint
+    async def put(self, version: int):
+        """Receive updated weights from the trainer.
+
+        Updates the internal state dictionary with weights from the trainer and
+        converts them to HuggingFace format for future distribution to generators.
+
+        Args:
+            version (int): The new version number for these weights
+        """
+        logger = get_logger()
+        logger.info("Receiving weights from trainer...")
+        await self.lock.acquire()
+        for k in sorted(self.train_state_dict.keys()):
+            v = self.train_state_dict[k]
+            torch.distributed.recv(v, src=1)
+
+        torch.distributed.barrier()
+        self.hf_state_dict = self._prepare_hf_weights()
+        logger.info("Done receiving weights from trainer.")
+        self.version = version
+        self.lock.release()
+
+    @endpoint
+    async def get_version(self) -> int:
+        """Get the current version of the model weights.
+
+        Returns:
+            int: The current version number
+        """
         return self.version
 
-    @endpoint
-    async def receive_from_trainer(self):
-        self.logger.info("receiving weights from trainer")
-        await self.state_dict_lock.acquire()
-        for k in sorted(self.state_dict.keys()):
-            v = self.state_dict[k]
-            torch.distributed.recv(v, src=1)
-        torch.distributed.barrier()
-        self.hf_state_dict = self._maybe_map_weights(self.state_dict)
-        self.logger.info("done receiving weights from trainer")
-        self.version += 1
-        self.version_tensor += 1
-        self.state_dict_lock.release()
-
-    @endpoint
-    async def get_model_metadata(self) -> dict[str, tuple[torch.Size, torch.Size]]:
-        return self._model_metadata
-
     def __repr__(self) -> str:
-        return "ParameterServerActor"
+        return "HFVLLMParameterServer"
 
 
 class VLLMHFWeightUpdateReceiver(WeightUpdateReceiverBase):
@@ -356,13 +476,12 @@ class VLLMHFWeightUpdateReceiver(WeightUpdateReceiverBase):
         self,
         master_address: str,
         master_port: int,
-        param_server: ParameterServerActor,
+        param_store: ParameterStore,
         worker_idx,
     ):
         self.master_address = master_address
         self.master_port = master_port
-        self.initialized_group = None
-        self.param_server = param_server
+        self.param_store = param_store
         self.worker_idx = worker_idx
         self.model_metadata = None
 
@@ -378,40 +497,39 @@ class VLLMHFWeightUpdateReceiver(WeightUpdateReceiverBase):
         # so we don't implement this for now
         return None
 
+    async def connect_with_parameter_store(self):
+        logger = get_logger()
+        logger.info("Connecting with parameter store...")
+        logger.info("Got model metadata")
+        weight_sync_world_size = (
+            self.collector.inference_server.llm_engine.parallel_config.tensor_parallel_size
+            + 1
+        )
+        self.collector.inference_server.collective_rpc(
+            "init_weight_update_group",
+            args=(
+                self.master_address,
+                self.master_port,
+                1,
+                weight_sync_world_size,
+            ),
+        )
+
     async def update_weights2(self):
         logger = get_logger()
         logger.info("updating weights")
-
         if not self.model_metadata:
-            self.model_metadata = await self.param_server.get_model_metadata().call()
-        # should_update = await self.param_server.skip_update(self.worker_idx).call()
-        # if should_update:
-        fut = self.param_server.sync_weights_with_worker(self.worker_idx).call()
-        inference_server = self.collector.inference_server
-        if self.initialized_group is None:
-            weight_sync_world_size = (
-                inference_server.llm_engine.parallel_config.tensor_parallel_size + 1
+            self.model_metadata = (
+                await self.param_store.get_generator_model_metadata().call()
             )
-            inference_server.collective_rpc(
-                "init_weight_update_group",
-                args=(
-                    self.master_address,
-                    self.master_port,
-                    1,
-                    weight_sync_world_size,
-                ),
-            )
-            self.initialized_group = True
+        fut = self.param_store.get(self.worker_idx).call()
 
-        # logger.info(
-        #     "beginning broadcasts, sorted keys are: {}".format(
-        #         sorted(self.model_metadata.keys())
-        #     )
-        # )
         for k in sorted(self.model_metadata.keys()):
             dtype, shape = self.model_metadata[k]
             # logger.info("broadcast: {}".format(k))
-            inference_server.collective_rpc("update_weight", args=(k, dtype, shape))
+            self.collector.inference_server.collective_rpc(
+                "update_weight", args=(k, dtype, shape)
+            )
 
         logger.info(
             "worker {} done with broadcasts, waiting for version".format(
@@ -442,18 +560,6 @@ class VLLMWorkerWrapper(Worker):
         from vllm.distributed.parallel_state import get_world_group
 
         rank = get_world_group().rank + rank_offset
-
-        logger = get_logger()
-        logger.info(
-            "initializing model update group: addr: {}, port: {}, rank: {}, world_size: {}, device: {}, visible devices: {}".format(
-                master_address,
-                master_port,
-                rank,
-                world_size,
-                self.device,
-                os.environ.get("CUDA_VISIBLE_DEVICES", None),
-            )
-        )
         self._model_update_group = stateless_init_process_group(
             master_address=master_address,
             master_port=master_port,
@@ -461,7 +567,6 @@ class VLLMWorkerWrapper(Worker):
             world_size=world_size,
             device=self.device,
         )
-        logger.info("done initializing stateless process group")
         self.version = torch.tensor([0], device="cuda")
 
     def update_weight(self, name, dtype, shape):
@@ -851,7 +956,7 @@ class RolloutActor(Actor):
         cfg: DictConfig,
         metric_actor: MetricsLoggerActor,
         rollout_queue_actor: QueueActor,
-        param_server: ParameterServerActor,
+        param_store: ParameterStore,
         address: str,
         port: int,
         reset_at_each_iter: bool = False,
@@ -864,7 +969,7 @@ class RolloutActor(Actor):
         self.dialog_turns_per_batch = dialog_turns_per_batch
         self._metric_actor = metric_actor
         self._rollout_queue_actor = rollout_queue_actor
-        self._param_server = param_server
+        self._param_store = param_store
         self._weight_update_receiver_address = address
         self._weight_update_receiver_port = port
 
@@ -902,7 +1007,7 @@ class RolloutActor(Actor):
         weight_update_receiver = VLLMHFWeightUpdateReceiver(
             master_address=self._weight_update_receiver_address,
             master_port=self._weight_update_receiver_port,
-            param_server=self._param_server,
+            param_store=self._param_store,
             worker_idx=self.global_rank,
         )
         self.collector = SyncLLMCollector(
@@ -913,6 +1018,8 @@ class RolloutActor(Actor):
             dialog_turns_per_batch=self.dialog_turns_per_batch,
             weight_update_receiver=weight_update_receiver,
         )
+
+        await self.collector.weight_update_receiver.connect_with_parameter_store()
         self.logger.info("done with init!")
 
     @endpoint
@@ -924,7 +1031,7 @@ class RolloutActor(Actor):
         i = 0
         policy_version = 0
         while True:
-            ps_version = await self._param_server.current_policy_version().call()
+            ps_version = await self._param_store.get_version().call()
             if ps_version != policy_version:
                 self.logger.info(
                     "Updating weights from {} to {}...".format(
@@ -1274,7 +1381,7 @@ class TrainingActor(Actor):
         cfg: DictConfig,
         metric_actor: MetricsLoggerActor,
         replay_buffer: ReplayBufferActor,
-        param_server: ParameterServerActor,
+        param_store: ParameterStore,
         address: str,
         port: int,
     ):
@@ -1282,7 +1389,7 @@ class TrainingActor(Actor):
         self.local_rank = current_rank()["gpus"]
         self.metric_actor = metric_actor
         self.replay_buffer = replay_buffer
-        self.param_server = param_server
+        self.param_store = param_store
         self.logger = get_logger()
         self._address = address
         self._port = port
@@ -2078,17 +2185,13 @@ class TrainingActor(Actor):
         self.logger.info("syncing weights w/ PS at {}".format(self.policy_version))
         # TODO - replace w/ rdmabuffer
         if self._is_rank_zero:
-            # await self.param_server.acquire_write_lock().call()
-            # self.logger.info("acquired lock")
-            h = self.param_server.receive_from_trainer().call()
-            # TODO - we probably need some way to ensure that the keys are in order for any weight transfer...
+            h = self.param_store.put(version=self.policy_version).call()
             for k in sorted(new_sd.keys()):
                 v = new_sd[k]
                 # dst is global rank, can switch to group_dst arg if not 2.5.1
                 torch.distributed.send(v, dst=0)
             torch.distributed.barrier()
             await h
-            # await self.param_server.release_write_lock().call()
         else:
             torch.distributed.barrier()
         self.logger.info("done weight syncs w/ PS")
@@ -2237,19 +2340,18 @@ class MonarchGRPORecipe(OrchestrationRecipeInterface):
         )
         self.logger.info("spawning param server actor")
 
-        self.param_server_proc_mesh = await proc_mesh(
+        self.param_store_proc_mesh = await proc_mesh(
             gpus=1,
             env=env,
         )
-        self.param_server_actor = await self.param_server_proc_mesh.spawn(
-            "param_server",
-            ParameterServerActor,
+        self.param_store_actor = await self.param_store_proc_mesh.spawn(
+            "param_store",
+            HFVLLMParameterServer,
             cfg=cfg,
-            vllm_master_addresses=vllm_addresses,
-            vllm_master_ports=vllm_ports,
-            trainer_addr=trainer_address,
-            trainer_port=trainer_port,
         )
+
+        self.dist_info_map = {}
+
         # Create rollout actors and meshes
         self.rollout_proc_meshes = []
         self.rollout_actor_meshes = []
@@ -2266,18 +2368,22 @@ class MonarchGRPORecipe(OrchestrationRecipeInterface):
                     env=env,
                 )
             )
-            self.rollout_actor_meshes.append(
-                await self.rollout_proc_meshes[i].spawn(
-                    "rollout_actors",
-                    RolloutActor,
-                    global_rank=i,
-                    cfg=cfg,
-                    address=vllm_addresses[i],
-                    port=vllm_ports[i],
-                    metric_actor=self.metric_actor,
-                    rollout_queue_actor=self.rollout_queue_actor,
-                    param_server=self.param_server_actor,
-                )
+            generator = await self.rollout_proc_meshes[i].spawn(
+                "rollout_actors",
+                RolloutActor,
+                global_rank=i,
+                cfg=cfg,
+                address=vllm_addresses[i],
+                port=vllm_ports[i],
+                metric_actor=self.metric_actor,
+                rollout_queue_actor=self.rollout_queue_actor,
+                param_store=self.param_store_actor,
+            )
+            self.rollout_actor_meshes.append(generator)
+            self.dist_info_map[generator] = DistributedInfo(
+                address=vllm_addresses[i],
+                port=vllm_ports[i],
+                world_size=inference_tp + 1,
             )
 
         # Create postprocess actors and meshes
@@ -2320,9 +2426,20 @@ class MonarchGRPORecipe(OrchestrationRecipeInterface):
             cfg=cfg,
             metric_actor=self.metric_actor,
             replay_buffer=self.replay_buffer_actor,
-            param_server=self.param_server_actor,
+            param_store=self.param_store_actor,
             address=trainer_address,
             port=trainer_port,
+        )
+        self.dist_info_map[self.training_actor] = DistributedInfo(
+            address=trainer_address,
+            port=trainer_port,
+            world_size=cfg.orchestration.num_training_workers + 1,
+        )
+        self.actor_set = ActorSet(
+            param_store=self.param_store_actor,
+            metric_logger=self.metric_actor,
+            trainer=self.training_actor,
+            generators=self.rollout_actor_meshes,
         )
 
         self.all_actors = (
@@ -2334,9 +2451,11 @@ class MonarchGRPORecipe(OrchestrationRecipeInterface):
     async def run(self):
         self.logger.info("initializing actors")
         await asyncio.gather(
-            *[
-                a.initialize().broadcast_and_wait()
-                for a in self.all_actors + [self.param_server_actor]
+            *[a.initialize().broadcast_and_wait() for a in self.all_actors]
+            + [
+                self.param_store_actor.initialize(
+                    actor_set=self.actor_set, dist_info_map=self.dist_info_map
+                ).broadcast_and_wait()
             ]
         )
         self.logger.info("running actors")
