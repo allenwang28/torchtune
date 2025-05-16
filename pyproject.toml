@@ -71,6 +71,7 @@ async_rl = [
 
     # Regular PyPI dependencies
     "ray",
+    "readerwriterlock",
     "vllm==0.8.4",
     "wandb",
 
