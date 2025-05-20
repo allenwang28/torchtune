@@ -37,7 +37,7 @@ from torchrl.data import LazyStackStorage, ReplayBuffer
 from torchtune import config, generation, rlhf, utils
 from torchtune.dev.rl.datatypes import RequestOutput, Trajectory
 from torchtune.dev.rl.monarch_actors import get_logger, MetricsLoggerActor
-from torchtune.dev.rl.rewards import batched_rewards
+from torchtune.dev.rl.rewards_async import batched_rewards
 from torchtune.dev.rl.types import GRPOStats, GRPOTrajectory
 
 from torchtune.dev.rl.utils import stateless_init_process_group
@@ -484,6 +484,12 @@ class HFVLLMParameterServer(ParameterStore):
         torch.distributed.barrier()
         self.hf_state_dict = self._prepare_hf_weights()
         logger.info("Done receiving weights from trainer.")
+        i = 0
+        for k, v in self.hf_state_dict.items():
+            if i > 5:
+                break
+            logger.info("{}: {}".format(k, v))
+            i += 1
         self.version = version
         self.lock.release()
 
@@ -672,6 +678,8 @@ class SyncLLMCollector(SyncDataCollector):
         )
         from vllm import LLM
 
+        # logger.info("engine args: {}".format(self.cfg.inference.get("engine_args", {})))
+        # os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         self.inference_server = LLM(
             model=self.cfg.inference.model,
             enforce_eager=True,
@@ -680,12 +688,14 @@ class SyncLLMCollector(SyncDataCollector):
             worker_cls=VLLMWorkerWrapper,
             tensor_parallel_size=self.cfg.inference.tensor_parallel_dim,
             device=device,
+            seed=42,
             **self.cfg.inference.get("engine_args", {}),
         )
         self.generation_time = 0
+
         super().__init__(
             create_env_fn=env,
-            policy=self.policy_fn,  # TODO - is this needed at all?
+            policy=self.policy_fn,
             frames_per_batch=self.dialog_turns_per_batch,
             total_frames=self.total_dialog_turns,
             weight_update_receiver=weight_update_receiver,
@@ -720,6 +730,8 @@ class SyncLLMCollector(SyncDataCollector):
         _TEXT_RESPONSE_KEY = "text_response"
         _LOG_PROBS_KEY = "log_probs"
 
+        logger = get_logger()
+
         from vllm import SamplingParams
 
         with self.device:
@@ -727,6 +739,26 @@ class SyncLLMCollector(SyncDataCollector):
             text_input = data.get("text")
             if not isinstance(text_input, (list, str)):
                 text_input = text_input.tolist()
+
+            # logger.info("text inputs: {}".format(text_input))
+
+            # params = (
+            #     SamplingParams(
+            #         n=1,
+            #         max_tokens=self.cfg.inference.max_generated_tokens,
+            #         temperature=self.cfg.inference.temperature,
+            #         detokenize=True,
+            #         prompt_logprobs=False,
+            #         logprobs=True,
+            #     ),
+            # )
+            # logger.info("sampling params: {}".format(params))
+
+            # args = (text_input,)
+            # logger.info("prompts")
+            # for t in text_input:
+            #     logger.info("{}".format(t))
+
             token_outputs: List[vllmRequestOutput] = self.inference_server.generate(
                 text_input,
                 sampling_params=SamplingParams(
@@ -739,6 +771,13 @@ class SyncLLMCollector(SyncDataCollector):
                 ),
                 use_tqdm=False,
             )
+            # logger.info("token_outputs: {}".format(token_outputs))
+            # logger.info("prompts:")
+            # for r in token_outputs:
+            #     logger.info(r.prompt)
+            # logger.info("outputs:")
+            # for r in token_outputs:
+            #     logger.info(r.outputs)
             # convert the vllmRequestOutput to a TensorDict
             outputs: RequestOutput = RequestOutput.from_request_output(token_outputs)
             response = outputs.outputs._tensordict.select(
@@ -757,7 +796,9 @@ class SyncLLMCollector(SyncDataCollector):
                 padded_values = response[_TOK_RESPONSE_KEY] == padding
                 if padded_values.any():
                     lps = response[_LOG_PROBS_KEY]
+                    # logger.info("lps: {}".format(lps))
                     lps = torch.where(expand_as_right(~padded_values, lps), lps, 1.0)
+                    # logger.info("lps expanded: {}".format(lps))
                     response[_LOG_PROBS_KEY] = lps
 
             assert set(response.keys()) == set(
@@ -795,12 +836,29 @@ class SyncLLMCollector(SyncDataCollector):
             A StatefulDataLoader instance configured with the dataset and sampler
 
         """
+        # from torch.utils.data import Dataset
+
         # Not importing here and doing these imports globally will cause VLLM worker
         # to have no cuda devices during cuda lazy init for some reason?? Even when
         # this method is not actually called...
         from torchtune import config
         from torchtune.config._utils import _get_component_from_path
         from torchtune.datasets import ConcatDataset
+
+        # class SingleExampleDataset(Dataset):
+        #     def __init__(self, original_dataset):
+        #         self.original_dataset = original_dataset
+        #         self.single_example = self.original_dataset[0]  # Load the first example
+
+        #     def __getitem__(self, index):
+        #         logger = get_logger()
+        #         logger.info("item: {}".format(self.single_example))
+        #         return self.single_example
+
+        #     def __len__(self):
+        #         return len(
+        #             self.original_dataset
+        #         )  # Or any large number to simulate repetiti
 
         if isinstance(cfg_dataset, ListConfig):
             datasets = [
@@ -810,6 +868,9 @@ class SyncLLMCollector(SyncDataCollector):
             ds = ConcatDataset(datasets=datasets)
         else:
             ds = config.instantiate(cfg_dataset, self._tokenizer)
+
+        # ds = SingleExampleDataset(ds)
+
         sampler = StatefulDistributedSampler(
             ds,
             # FIXME: hardcoding num_replicas and rank for now
@@ -854,15 +915,11 @@ class SyncLLMCollector(SyncDataCollector):
             TensorDictBase: Tensor dictionary containing all collected trajectories and
                 other runtime metrics.
         """
-        if self.reset_at_each_iter or self._shuttle is None:
-            data = self.env.reset()
-        else:
-            data = self._shuttle
-
+        data = self.env.reset()
         trajectories = []
         collected_frames = 0
         while collected_frames < self.dialog_turns_per_batch:
-            action = self.policy_fn(data)
+            action = self.policy(data)
 
             env_output, env_next_output = self.env.step_and_maybe_reset(action)
 
@@ -895,20 +952,31 @@ class SyncLLMCollector(SyncDataCollector):
             - Trajectory: Structured representation of collected trajectories with metadata
             - Dict[str, float]: Runtime metrics including generation time and memory usage
         """
+        # logger = get_logger()
         # TODO - replace perf counter with CUDA events
         start = time.perf_counter()
         # Convert raw trajectories into our Trajectory representation
         rollout_td = self.rollout().squeeze()
+        # logger.info("tokens: {}".format(rollout_td["tokens"]))
+        # logger.info("tokens response: {}".format(rollout_td["tokens_response"]))
         query_responses = torch.cat(
             [rollout_td["tokens"], rollout_td["tokens_response"]], dim=-1
         )
+        # logger.info("query_responses: {}".format(query_responses))
         response_tokens = rollout_td["tokens_response"]
+        # logger.info("response tokens: {}".format(response_tokens))
         logprobs = rollout_td["log_probs"]
+        # logger.info("logprobs: {}".format(logprobs))
         query_response_padding_masks = torch.ne(query_responses, self._tokenizer.pad_id)
+        # logger.info(
+        #     "query_response_padding_masks: {}".format(query_response_padding_masks)
+        # )
         answers = rollout_td["answers"]
 
         response_padding_masks = torch.eq(response_tokens, self._tokenizer.pad_id)
+        # logger.info("response padding masks: {}".format(response_padding_masks))
         seq_lens = training.get_unmasked_sequence_lengths(response_padding_masks)
+        # logger.info("seq_lens: {}".format(seq_lens))
         del response_padding_masks
 
         # Generate unique sequence IDs for the batch
@@ -922,6 +990,7 @@ class SyncLLMCollector(SyncDataCollector):
             ]
         )
         total_generated_tokens = seq_lens.sum().item()
+        # logger.info("total tokens generated: {}".format(total_generated_tokens))
 
         trajectory = Trajectory(
             query_responses=query_responses.to("cpu"),
@@ -952,11 +1021,13 @@ class SyncLLMCollector(SyncDataCollector):
         )
         div_gib = 1024**3
         gpu_memory_peak_allocated_gib = (
-            torch.cuda.max_memory_allocated(device="cuda:0") / div_gib
+            torch.cuda.max_memory_allocated(device=self.device) / div_gib
         )
-        memory_reserved_gib = torch.cuda.max_memory_reserved(device="cuda:0") / div_gib
+        memory_reserved_gib = (
+            torch.cuda.max_memory_reserved(device=self.device) / div_gib
+        )
         memory_active_gib = (
-            torch.cuda.memory_stats(device="cuda:0").get("active_bytes.all.peak", 0)
+            torch.cuda.memory_stats(device=self.device).get("active_bytes.all.peak", 0)
             / div_gib
         )
         runtime_metrics = {
@@ -981,7 +1052,7 @@ class RolloutActor(Actor):
         rollout_queue_actor: QueueActor,
         param_store: ParameterStore,
         dist_info: DistributedInfo,
-        reset_at_each_iter: bool = False,
+        reset_at_each_iter: bool = True,
         dialog_turns_per_batch: int = 1,
     ):
         self.cfg = cfg
@@ -1337,12 +1408,18 @@ class PostProcessingActor(Actor):
 
                 # Compute rewards
                 responses = responses.reshape(batch_size, group_size, -1)
-                rewards_by_fn, successes_by_fn, reward_metadata = batched_rewards(
+                # logger.info("answers: {}".format(answers))
+                # logger.info("responses: {}".format(responses))
+                rewards_by_fn, successes_by_fn, reward_metadata = await batched_rewards(
                     self._tokenizer, responses, answers, device=self._device
                 )  # These are (B, G, num_funcs)
 
+                logger.info("rewards_by_fn: {}".format(rewards_by_fn))
+                logger.info("successes_by_fn: {}".format(successes_by_fn))
+
                 # Compute advantages: B, G, num_funcs -> B, G
                 group_rewards = rewards_by_fn.sum(-1)
+                logger.info("group_rewards: {}".format(group_rewards))
 
                 # To compute advantage, subtract the mean of the group rewards from each group reward
                 group_advantages = (
