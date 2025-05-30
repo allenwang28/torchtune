@@ -15,6 +15,17 @@ Current steps:
 conda create -n monarch_tune python=3.10
 conda activate monarch_tune
 
+# CUDA env setup - this will be used in vllm and in monarch
+# Check ls /usr/local/cuda-* to see the versions of CUDA that are installed, let's assume 12.4
+export CUDA_VERSION=12.4
+export NVCC=/usr/local/cuda-${CUDA_VERSION}/bin/nvcc
+export CUDA_NVCC_EXECUTABLE=/usr/local/cuda-${CUDA_VERSION}/bin/nvcc
+export CUDA_HOME=/usr/local/cuda-${CUDA_VERSION}
+export PATH="${CUDA_HOME}/bin:$PATH"
+export CUDA_INCLUDE_DIRS=$CUDA_HOME/include
+export CUDA_CUDART_LIBRARY=$CUDA_HOME/lib64/libcudart.so
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+
 # TorchTune setup
 cd ../
 git clone -b monarch_dev https://github.com/allenwang28/torchtune
@@ -24,7 +35,6 @@ pip install torch==2.7.0
 pip install -e .[async_rl]
 
 # vLLM setup - we need 0.8.4, but we need torch 2.7 (otherwise trainer hangs on distributed tensor setup)
-
 git clone -b v0.8.4 https://github.com/vllm-project/vllm
 cd vllm
 python use_existing_torch.py
