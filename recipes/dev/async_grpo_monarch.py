@@ -484,12 +484,6 @@ class HFVLLMParameterServer(ParameterStore):
         torch.distributed.barrier()
         self.hf_state_dict = self._prepare_hf_weights()
         logger.info("Done receiving weights from trainer.")
-        i = 0
-        for k, v in self.hf_state_dict.items():
-            if i > 5:
-                break
-            logger.info("{}: {}".format(k, v))
-            i += 1
         self.version = version
         self.lock.release()
 
@@ -552,9 +546,9 @@ class VLLMHFWeightUpdateReceiver(WeightUpdateReceiverBase):
         logger.info("updating weights")
         if not self.model_metadata:
             self.model_metadata = (
-                await self.param_store.get_generator_model_metadata().call()
+                await self.param_store.get_generator_model_metadata.call_one()
             )
-        fut = self.param_store.get(self.worker_idx).call()
+        fut = self.param_store.get.call_one(self.worker_idx)
 
         for k in sorted(self.model_metadata.keys()):
             dtype, shape = self.model_metadata[k]
@@ -678,8 +672,6 @@ class SyncLLMCollector(SyncDataCollector):
         )
         from vllm import LLM
 
-        # logger.info("engine args: {}".format(self.cfg.inference.get("engine_args", {})))
-        # os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         self.inference_server = LLM(
             model=self.cfg.inference.model,
             enforce_eager=True,
@@ -688,11 +680,9 @@ class SyncLLMCollector(SyncDataCollector):
             worker_cls=VLLMWorkerWrapper,
             tensor_parallel_size=self.cfg.inference.tensor_parallel_dim,
             device=device,
-            seed=42,
             **self.cfg.inference.get("engine_args", {}),
         )
         self.generation_time = 0
-
         super().__init__(
             create_env_fn=env,
             policy=self.policy_fn,
@@ -739,26 +729,6 @@ class SyncLLMCollector(SyncDataCollector):
             text_input = data.get("text")
             if not isinstance(text_input, (list, str)):
                 text_input = text_input.tolist()
-
-            # logger.info("text inputs: {}".format(text_input))
-
-            # params = (
-            #     SamplingParams(
-            #         n=1,
-            #         max_tokens=self.cfg.inference.max_generated_tokens,
-            #         temperature=self.cfg.inference.temperature,
-            #         detokenize=True,
-            #         prompt_logprobs=False,
-            #         logprobs=True,
-            #     ),
-            # )
-            # logger.info("sampling params: {}".format(params))
-
-            # args = (text_input,)
-            # logger.info("prompts")
-            # for t in text_input:
-            #     logger.info("{}".format(t))
-
             token_outputs: List[vllmRequestOutput] = self.inference_server.generate(
                 text_input,
                 sampling_params=SamplingParams(
@@ -771,13 +741,6 @@ class SyncLLMCollector(SyncDataCollector):
                 ),
                 use_tqdm=False,
             )
-            # logger.info("token_outputs: {}".format(token_outputs))
-            # logger.info("prompts:")
-            # for r in token_outputs:
-            #     logger.info(r.prompt)
-            # logger.info("outputs:")
-            # for r in token_outputs:
-            #     logger.info(r.outputs)
             # convert the vllmRequestOutput to a TensorDict
             outputs: RequestOutput = RequestOutput.from_request_output(token_outputs)
             response = outputs.outputs._tensordict.select(
@@ -796,9 +759,7 @@ class SyncLLMCollector(SyncDataCollector):
                 padded_values = response[_TOK_RESPONSE_KEY] == padding
                 if padded_values.any():
                     lps = response[_LOG_PROBS_KEY]
-                    # logger.info("lps: {}".format(lps))
                     lps = torch.where(expand_as_right(~padded_values, lps), lps, 1.0)
-                    # logger.info("lps expanded: {}".format(lps))
                     response[_LOG_PROBS_KEY] = lps
 
             assert set(response.keys()) == set(
@@ -836,29 +797,12 @@ class SyncLLMCollector(SyncDataCollector):
             A StatefulDataLoader instance configured with the dataset and sampler
 
         """
-        # from torch.utils.data import Dataset
-
         # Not importing here and doing these imports globally will cause VLLM worker
         # to have no cuda devices during cuda lazy init for some reason?? Even when
         # this method is not actually called...
         from torchtune import config
         from torchtune.config._utils import _get_component_from_path
         from torchtune.datasets import ConcatDataset
-
-        # class SingleExampleDataset(Dataset):
-        #     def __init__(self, original_dataset):
-        #         self.original_dataset = original_dataset
-        #         self.single_example = self.original_dataset[0]  # Load the first example
-
-        #     def __getitem__(self, index):
-        #         logger = get_logger()
-        #         logger.info("item: {}".format(self.single_example))
-        #         return self.single_example
-
-        #     def __len__(self):
-        #         return len(
-        #             self.original_dataset
-        #         )  # Or any large number to simulate repetiti
 
         if isinstance(cfg_dataset, ListConfig):
             datasets = [
@@ -868,9 +812,6 @@ class SyncLLMCollector(SyncDataCollector):
             ds = ConcatDataset(datasets=datasets)
         else:
             ds = config.instantiate(cfg_dataset, self._tokenizer)
-
-        # ds = SingleExampleDataset(ds)
-
         sampler = StatefulDistributedSampler(
             ds,
             # FIXME: hardcoding num_replicas and rank for now
@@ -952,31 +893,20 @@ class SyncLLMCollector(SyncDataCollector):
             - Trajectory: Structured representation of collected trajectories with metadata
             - Dict[str, float]: Runtime metrics including generation time and memory usage
         """
-        # logger = get_logger()
         # TODO - replace perf counter with CUDA events
         start = time.perf_counter()
         # Convert raw trajectories into our Trajectory representation
         rollout_td = self.rollout().squeeze()
-        # logger.info("tokens: {}".format(rollout_td["tokens"]))
-        # logger.info("tokens response: {}".format(rollout_td["tokens_response"]))
         query_responses = torch.cat(
             [rollout_td["tokens"], rollout_td["tokens_response"]], dim=-1
         )
-        # logger.info("query_responses: {}".format(query_responses))
         response_tokens = rollout_td["tokens_response"]
-        # logger.info("response tokens: {}".format(response_tokens))
         logprobs = rollout_td["log_probs"]
-        # logger.info("logprobs: {}".format(logprobs))
         query_response_padding_masks = torch.ne(query_responses, self._tokenizer.pad_id)
-        # logger.info(
-        #     "query_response_padding_masks: {}".format(query_response_padding_masks)
-        # )
         answers = rollout_td["answers"]
 
         response_padding_masks = torch.eq(response_tokens, self._tokenizer.pad_id)
-        # logger.info("response padding masks: {}".format(response_padding_masks))
         seq_lens = training.get_unmasked_sequence_lengths(response_padding_masks)
-        # logger.info("seq_lens: {}".format(seq_lens))
         del response_padding_masks
 
         # Generate unique sequence IDs for the batch
@@ -990,7 +920,6 @@ class SyncLLMCollector(SyncDataCollector):
             ]
         )
         total_generated_tokens = seq_lens.sum().item()
-        # logger.info("total tokens generated: {}".format(total_generated_tokens))
 
         trajectory = Trajectory(
             query_responses=query_responses.to("cpu"),
@@ -1110,7 +1039,7 @@ class RolloutActor(Actor):
         i = 0
         policy_version = 0
         while True:
-            ps_version = await self._param_store.get_version().call()
+            ps_version = await self._param_store.get_version.call_one()
             if ps_version != policy_version:
                 logger.info(
                     "Updating weights from {} to {}...".format(
@@ -1123,11 +1052,11 @@ class RolloutActor(Actor):
 
             logger.info(f"starting rollout for step {i} (policy {policy_version})")
             trajectories, runtime_metrics = self.collector.rollout_step(policy_version)
-            await self._metric_actor.log_dict(runtime_metrics, step=i).call()
+            await self._metric_actor.log_dict.call(runtime_metrics, step=i)
             # TODO - the first rollout step triggers vLLM initialization which should not be necessary.
             # We should be able to avoid this, but needs further investigation.
             # TODO - time the push to queue time?
-            await self._rollout_queue_actor.put(trajectories).call()
+            await self._rollout_queue_actor.put.call(trajectories)
             i += 1
 
     def __repr__(self) -> str:
@@ -1315,7 +1244,7 @@ class PostProcessingActor(Actor):
             log_dict[
                 f"postprocessing_worker_rewards/successes_func_{func_name}_mean"
             ] = func_mean.item()
-        await self.metric_actor.log_dict(log_dict, step=step_idx).call()
+        await self.metric_actor.log_dict.call(log_dict, step=step_idx)
 
     @endpoint
     async def run(self):
@@ -1337,7 +1266,7 @@ class PostProcessingActor(Actor):
                     if self._is_actor_zero:
                         logger.info("Getting from rollout_queue queue.")
                     # TODO - revisit this to check on failure conditions
-                    trajectory = await self.rollout_queue_actor.get().call()
+                    trajectory = await self.rollout_queue_actor.get.call()
                     trajectory = trajectory.to(self._device)
                 time_wait_end = time.perf_counter()
                 time_waiting_buffer = time_wait_end - time_step_start
@@ -1408,18 +1337,12 @@ class PostProcessingActor(Actor):
 
                 # Compute rewards
                 responses = responses.reshape(batch_size, group_size, -1)
-                # logger.info("answers: {}".format(answers))
-                # logger.info("responses: {}".format(responses))
                 rewards_by_fn, successes_by_fn, reward_metadata = await batched_rewards(
                     self._tokenizer, responses, answers, device=self._device
                 )  # These are (B, G, num_funcs)
 
-                logger.info("rewards_by_fn: {}".format(rewards_by_fn))
-                logger.info("successes_by_fn: {}".format(successes_by_fn))
-
                 # Compute advantages: B, G, num_funcs -> B, G
                 group_rewards = rewards_by_fn.sum(-1)
-                logger.info("group_rewards: {}".format(group_rewards))
 
                 # To compute advantage, subtract the mean of the group rewards from each group reward
                 group_advantages = (
@@ -1459,7 +1382,7 @@ class PostProcessingActor(Actor):
 
                 # Update circular queue
                 logger.info("extending replay buffer")
-                await self.replay_buffer.extend(trajectory).call()
+                await self.replay_buffer.extend.call(trajectory)
 
                 # End of step timing
                 time_total_ref_step = time.perf_counter() - time_step_start
@@ -1478,7 +1401,7 @@ class PostProcessingActor(Actor):
                         time_waiting_buffer=time_waiting_buffer,
                         # TODO: what should we do with this? We can log the total number of elements written in the buffer instead
                         # full_queue_data_discard=full_queue_data_discard,
-                        rollout_queue_size=await self.rollout_queue_actor.qsize().call(),
+                        rollout_queue_size=await self.rollout_queue_actor.qsize.call(),
                         rewards_mean=rewards_mean,
                         successes_mean=successes_mean,
                         rewards_mean_per_func=rewards_mean_per_func,
@@ -1692,20 +1615,18 @@ class TrainingActor(Actor):
               full state dicts are loaded with ``torch.load(mmap=True)``
         """
         logger = get_logger()
-        if self._is_rank_zero:
-            logger.info(
-                "FSDP is enabled. Instantiating model and loading checkpoint on Rank 0..."
-            )
-
+        logger.info("FSDP is enabled. Instantiating model and loading checkpoint...")
         time_setup_start = time.perf_counter()
-
+        logger.info("instantiating model")
         with training.set_default_dtype(self._dtype), torch.device("meta"):
             model = config.instantiate(cfg_model)
 
         if self._compile:
+            logger.info("compiling model")
             training.compile_model(model, verbose=self._is_rank_zero)
 
         if enable_activation_checkpointing:
+            logger.info("enabling activation checkpointing")
             training.set_activation_checkpointing(
                 model, auto_wrap_policy={TransformerSelfAttentionLayer}
             )
@@ -1713,6 +1634,7 @@ class TrainingActor(Actor):
         fsdp_shard_conditions = [
             partial(training.get_shard_conditions, names_to_match=custom_sharded_layers)
         ]
+        logger.info("sharding model")
         training.shard_model(
             model=model,
             shard_conditions=fsdp_shard_conditions,
@@ -1721,12 +1643,14 @@ class TrainingActor(Actor):
             dp_mesh=self.device_mesh,
         )
 
+        logger.info("setting dtypes and such")
         with training.set_default_dtype(self._dtype), self._device:
             for m in model.modules():
                 # RoPE is not covered in state dict
                 if hasattr(m, "rope_init"):
                     m.rope_init()
 
+        logger.info("loading full state dict")
         # This method will convert the full model state dict into a sharded state
         # dict and load into the model
         training.load_from_full_model_state_dict(
@@ -1745,6 +1669,7 @@ class TrainingActor(Actor):
         self.activations_handling_ctx = training.get_act_offloading_ctx_manager(
             model, enable_activation_offloading
         )
+        logger.info("creating activations handling ctx")
         training.validate_no_params_on_meta_device(model)
 
         if self._is_rank_zero and self._log_peak_memory_stats:
@@ -1754,6 +1679,7 @@ class TrainingActor(Actor):
         disable_dropout(model)
 
         # synchronize before training begins
+        logger.info("barrier before training begins")
         torch.distributed.barrier(group=self.fsdp_group)
         return model
 
@@ -1962,7 +1888,7 @@ class TrainingActor(Actor):
             }
         )
 
-        await self.metric_actor.log_dict(log_dict, step=step_idx).call()
+        await self.metric_actor.log_dict.call(log_dict, step=step_idx)
 
     async def _log_debug_table(
         self,
@@ -1994,9 +1920,9 @@ class TrainingActor(Actor):
                 for row in data:
                     table_data.append([row[col] for col in columns])
 
-                await self.metric_actor.log_table(
+                await self.metric_actor.log_table.call(
                     table_data, columns, table_name, step=self._steps_run
-                ).call()
+                )
             else:
                 logger.info(f"Failed to log {table_name} for step {self._steps_run}")
 
@@ -2168,17 +2094,17 @@ class TrainingActor(Actor):
                 time_waiting_buffer_start = time.perf_counter()
                 train_replay_buffer_size = None
                 if self._is_rank_zero:
-                    train_replay_buffer_size = await self.replay_buffer.len().call()
+                    train_replay_buffer_size = await self.replay_buffer.len.call()
 
                 num_waits = 0
-                while await self.replay_buffer.is_empty().call():
+                while await self.replay_buffer.is_empty.call():
                     if self._is_rank_zero and num_waits % 10 == 0:
                         logger.info("waiting for replay buffer...")
                     await asyncio.sleep(1)
                     num_waits += 1
 
                 # TODO - batching?
-                trajectory = await self.replay_buffer.sample().call()
+                trajectory = await self.replay_buffer.sample.call()
                 trajectory = trajectory.to(self._device)
                 time_waiting_buffer = time.perf_counter() - time_waiting_buffer_start
                 if self._is_rank_zero:
@@ -2309,7 +2235,7 @@ class TrainingActor(Actor):
         logger.info("syncing weights w/ PS at {}".format(self.policy_version))
         # TODO - replace w/ rdmabuffer
         if self._is_rank_zero:
-            h = self.param_store.put(version=self.policy_version).call()
+            h = self.param_store.put.call(version=self.policy_version)
             for k in sorted(new_sd.keys()):
                 v = new_sd[k]
                 # dst is global rank, can switch to group_dst arg if not 2.5.1
@@ -2566,16 +2492,17 @@ class MonarchGRPORecipe(OrchestrationRecipeInterface):
     async def run(self):
         logger = get_logger()
         logger.info("initializing actors")
+        # TODO - can we log which actors have and have not finished initializing somehow?
         await asyncio.gather(
-            *[a.initialize().broadcast_and_wait() for a in self.all_actors]
+            *[a.initialize.call() for a in self.all_actors]
             + [
-                self.param_store_actor.initialize(
+                self.param_store_actor.initialize.call(
                     actor_set=self.actor_set, dist_info_map=self.dist_info_map
-                ).broadcast_and_wait()
+                )
             ]
         )
-        logger.info("running actors")
-        await asyncio.gather(*[a.run().broadcast_and_wait() for a in self.all_actors])
+        logger.info("done initializing, starting to run actors")
+        await asyncio.gather(*[a.run.call() for a in self.all_actors])
 
     async def cleanup(self):
         logger = get_logger()
