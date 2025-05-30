@@ -1266,7 +1266,7 @@ class PostProcessingActor(Actor):
                     if self._is_actor_zero:
                         logger.info("Getting from rollout_queue queue.")
                     # TODO - revisit this to check on failure conditions
-                    trajectory = await self.rollout_queue_actor.get.call()
+                    trajectory = await self.rollout_queue_actor.get.call_one()
                     trajectory = trajectory.to(self._device)
                 time_wait_end = time.perf_counter()
                 time_waiting_buffer = time_wait_end - time_step_start
@@ -1401,7 +1401,7 @@ class PostProcessingActor(Actor):
                         time_waiting_buffer=time_waiting_buffer,
                         # TODO: what should we do with this? We can log the total number of elements written in the buffer instead
                         # full_queue_data_discard=full_queue_data_discard,
-                        rollout_queue_size=await self.rollout_queue_actor.qsize.call(),
+                        rollout_queue_size=await self.rollout_queue_actor.qsize.call_one(),
                         rewards_mean=rewards_mean,
                         successes_mean=successes_mean,
                         rewards_mean_per_func=rewards_mean_per_func,
@@ -1615,8 +1615,13 @@ class TrainingActor(Actor):
               full state dicts are loaded with ``torch.load(mmap=True)``
         """
         logger = get_logger()
-        logger.info("FSDP is enabled. Instantiating model and loading checkpoint...")
+        if self._is_rank_zero:
+            logger.info(
+                "FSDP is enabled. Instantiating model and loading checkpoint on Rank 0..."
+            )
+
         time_setup_start = time.perf_counter()
+
         logger.info("instantiating model")
         with training.set_default_dtype(self._dtype), torch.device("meta"):
             model = config.instantiate(cfg_model)
